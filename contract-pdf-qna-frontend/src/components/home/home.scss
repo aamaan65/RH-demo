@@ -18,6 +18,78 @@
         width: 926px;
         max-width: 926px;
 
+        .calls_intro {
+          margin-top: 48px;
+          display: flex;
+          justify-content: center;
+        }
+
+        .calls_intro_card {
+          width: 100%;
+          border: 1px solid #ededed;
+          border-radius: 16px;
+          padding: 22px 22px;
+          background: linear-gradient(180deg, #fbfcff 0%, #ffffff 100%);
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.06);
+        }
+
+        .calls_intro_badge {
+          display: inline-flex;
+          align-items: center;
+          padding: 6px 10px;
+          border-radius: 999px;
+          border: 1px solid #dfe6ff;
+          background: #eef1ff;
+          color: #2f3a57;
+          font-size: 12px;
+          font-weight: 700;
+          letter-spacing: 0.2px;
+          margin-bottom: 12px;
+        }
+
+        .calls_intro_title {
+          font-size: 18px;
+          font-weight: 800;
+          color: #222222;
+          margin-bottom: 8px;
+        }
+
+        .calls_intro_subtitle {
+          font-size: 14px;
+          font-weight: 500;
+          line-height: 20px;
+          color: #4a4a4a;
+          margin-bottom: 16px;
+        }
+
+        .calls_intro_steps {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 12px;
+          margin-bottom: 6px;
+        }
+
+        .calls_intro_step {
+          border: 1px solid #eeeeee;
+          border-radius: 12px;
+          background: #ffffff;
+          padding: 12px 12px;
+
+          .label {
+            font-size: 13px;
+            font-weight: 800;
+            color: #333333;
+            margin-bottom: 6px;
+          }
+
+          .text {
+            font-size: 12px;
+            line-height: 18px;
+            color: #666666;
+            font-weight: 500;
+          }
+        }
+
         .chat_container {
           margin-top: 48px;
           height: calc(100vh - 244px);
@@ -84,6 +156,97 @@
             color: #9a9a9a;
           }
         }
+
+        .calls_progress {
+          margin-top: 14px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 12px 14px;
+          border: 1px solid #cfd9ff;
+          border-radius: 12px;
+          background: #eef1ff;
+          box-shadow: 0 10px 24px rgba(0, 0, 0, 0.08);
+
+          .spinner {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            border: 2px solid rgba(47, 58, 87, 0.25);
+            border-top-color: #5e7bc6;
+            animation: blocking_spinner 0.8s linear infinite;
+          }
+
+          .text {
+            font-size: 14px;
+            font-weight: 800;
+            color: #2f3a57;
+          }
+        }
+
+        .calls_progress_sticky {
+          position: sticky;
+          top: 8px;
+          z-index: 5;
+        }
+
+        .calls_decision {
+          margin-top: 10px;
+          padding: 14px 14px;
+          border-radius: 14px;
+          border: 1px solid #e6e6e6;
+          background: #ffffff;
+          box-shadow: 0 10px 24px rgba(0, 0, 0, 0.08);
+
+          .headline {
+            font-size: 14px;
+            font-weight: 900;
+            color: #2f3a57;
+            margin-bottom: 6px;
+
+            .value {
+              font-weight: 900;
+            }
+          }
+
+          .short {
+            font-size: 14px;
+            font-weight: 700;
+            color: #222222;
+            margin-bottom: 8px;
+          }
+
+          .reasons {
+            margin: 0;
+            padding-left: 18px;
+            color: #3a3a3a;
+            font-size: 13px;
+            line-height: 18px;
+            font-weight: 600;
+          }
+
+          .cite {
+            margin-top: 8px;
+            font-size: 12px;
+            font-weight: 700;
+            color: #5b5b5b;
+          }
+        }
+
+        .calls_decision_approved {
+          border-color: #bfe6c8;
+          background: #f3fff6;
+        }
+
+        .calls_decision_rejected {
+          border-color: #f1b9b9;
+          background: #fff6f6;
+        }
+
+        .calls_decision_cannot_determine {
+          border-color: #d7d7d7;
+          background: #fafafa;
+        }
       }
       .inpufield_wrapper {
         width: 926px;
@@ -113,6 +276,12 @@
           display: block;
           margin-left: auto;
           margin-right: auto;
+        }
+
+        .add_transcript_button:disabled {
+          opacity: 0.55;
+          cursor: not-allowed;
+          filter: grayscale(0.2);
         }
       }
     }

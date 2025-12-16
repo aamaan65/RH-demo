@@ -52,6 +52,10 @@ const Home = ({ bearerToken, setBearerToken }) => {
   const [conversationStatus, setConversationStatus] = useState("active");
   const [callsTranscriptName, setCallsTranscriptName] = useState("");
   const [callsGenerationStage, setCallsGenerationStage] = useState("idle"); // idle | generating | done
+  const [callsProgressText, setCallsProgressText] = useState("");
+  const [callsTotalQuestions, setCallsTotalQuestions] = useState(0);
+  const [callsAnsweredCount, setCallsAnsweredCount] = useState(0);
+  const [callsClaimDecision, setCallsClaimDecision] = useState(null);
   const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
   const [isCheckingExistingTranscriptConversation, setIsCheckingExistingTranscriptConversation] =
     useState(false);
@@ -135,6 +139,10 @@ const Home = ({ bearerToken, setBearerToken }) => {
   );
 
   const handleOpenTranscriptModal = () => {
+    // Prevent opening a new transcript while we are still streaming answers / summary
+    if (callsGenerationStage === "generating") {
+      return;
+    }
     if (!sessionStorage.getItem("idToken")) {
       setError("login");
       return;
@@ -207,82 +215,259 @@ const Home = ({ bearerToken, setBearerToken }) => {
     // Show a transcript header + generation stage while processing
     setCallsTranscriptName(transcript.name || transcript.id);
     setCallsGenerationStage("generating");
+    setCallsProgressText("Starting transcript processing…");
+    setCallsTotalQuestions(0);
+    setCallsAnsweredCount(0);
+    setCallsClaimDecision(null);
     setChats([]);
     setFinalSummary("");
     setIsTranscriptModalOpen(false);
     // Trigger sidebar refresh shortly after the backend receives the request (it now creates a processing stub early).
     setTimeout(() => setSidebarRefreshTick((t) => t + 1), 600);
 
-    axios
-      .post(`${TRANSCRIPTS_API_BASE_URL}/transcripts/process`, requestBody)
-      .then((response) => {
-        const conversationIdFromApi = response?.data?.conversationId || "";
-        const questions = response?.data?.questions || [];
-        const apiFinalSummary = response?.data?.finalSummary || "";
-        const extractionWarning = response?.data?.warning;
-        setFinalSummary(apiFinalSummary);
-        setConversationStatus((response?.data?.status || "active").toLowerCase());
-        setCallsGenerationStage("done");
-        setCallsTranscriptName(
-          response?.data?.transcriptMetadata?.fileName ||
-            response?.data?.transcriptId ||
-            transcript.name ||
-            transcript.id
-        );
+    const runNonStreamingFallback = () => {
+      setCallsProgressText("Generating answers…");
+      axios
+        .post(`${TRANSCRIPTS_API_BASE_URL}/transcripts/process`, requestBody)
+        .then((response) => {
+          const conversationIdFromApi = response?.data?.conversationId || "";
+          const questions = response?.data?.questions || [];
+          const apiFinalSummary = response?.data?.finalSummary || "";
+          const extractionWarning = response?.data?.warning;
+          setFinalSummary(apiFinalSummary);
+          setCallsClaimDecision(response?.data?.claimDecision || null);
+          setConversationStatus((response?.data?.status || "active").toLowerCase());
+          setCallsGenerationStage("done");
+          setCallsProgressText("");
+          setCallsTranscriptName(
+            response?.data?.transcriptMetadata?.fileName ||
+              response?.data?.transcriptId ||
+              transcript.name ||
+              transcript.id
+          );
 
-        // Map transcript questions/answers into existing chat shape.
-        // Keep chunks in JSON so the UI can render them as structured "Data Chunks".
-        const mappedChats =
-          questions.length > 0
-            ? questions.map((q) => {
-                const chunks = q.relevantChunks || [];
-                const isFinal = q.questionId === "final_answer";
-                return {
-                  entered_query: q.question,
-                  response: q.answer,
-                  chat_id: q.questionId,
-                  // keep extra metadata in case we want it later
-                  questionId: q.questionId,
-                  questionType: q.questionType,
-                  userIntent: q.userIntent,
-                  relevant_chunks: chunks,
-                  underlying_model: requestBody.gptModel,
-                  source: isFinal ? "final_answer" : "transcript_extracted",
-                };
-              })
-            : [
-                {
-                  entered_query: "",
-                  response:
-                    extractionWarning ||
-                    "No questions were extracted for this transcript.",
-                  source: "transcript_extracted",
-                },
-              ];
+          const mappedChats =
+            questions.length > 0
+              ? questions.map((q) => {
+                  const chunks = q.relevantChunks || [];
+                  const isFinal = q.questionId === "final_answer";
+                  return {
+                    entered_query: q.question,
+                    response: q.answer,
+                    chat_id: q.questionId,
+                    questionId: q.questionId,
+                    questionType: q.questionType,
+                    userIntent: q.userIntent,
+                    relevant_chunks: chunks,
+                    underlying_model: requestBody.gptModel,
+                    source: isFinal ? "final_answer" : "transcript_extracted",
+                  };
+                })
+              : [
+                  {
+                    entered_query: "",
+                    response:
+                      extractionWarning ||
+                      "No questions were extracted for this transcript.",
+                    source: "transcript_extracted",
+                  },
+                ];
 
-        setChats(mappedChats);
-        setIsCallsMode(true);
-        setGptModelState("Calls");
-        setSidebarRefreshTick((t) => t + 1);
+          setChats(mappedChats);
+          setIsCallsMode(true);
+          setGptModelState("Calls");
+          setSidebarRefreshTick((t) => t + 1);
 
-        // Navigate to the persisted conversation so the input switches from "Add Transcript" to ChatInput
-        if (conversationIdFromApi) {
-          navigate(`/conversation/${conversationIdFromApi}`);
-        }
-      })
-      .catch((error) => {
-        setCallsGenerationStage("idle");
-        setChats([
-          {
-            entered_query: "",
-            response: "An error occurred while processing your request.",
+          if (conversationIdFromApi) {
+            navigate(`/conversation/${conversationIdFromApi}`);
+          }
+        })
+        .catch((error) => {
+          setCallsGenerationStage("idle");
+          setCallsProgressText("");
+          setChats([
+            {
+              entered_query: "",
+              response: "An error occurred while processing your request.",
+            },
+          ]);
+          console.error("Error processing transcript with /transcripts/process:", error);
+        });
+    };
+
+    const runStreaming = async () => {
+      const token = sessionStorage.getItem("idToken");
+      if (!token) {
+        runNonStreamingFallback();
+        return;
+      }
+
+      const streamUrl = `${TRANSCRIPTS_API_BASE_URL}/transcripts/process/stream`;
+      let conversationIdFromStream = "";
+
+      try {
+        const resp = await fetch(streamUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + token,
           },
-        ]);
-        console.error(
-          "Error processing transcript with /transcripts/process:",
-          error
-        );
-      });
+          body: JSON.stringify(requestBody),
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Streaming request failed: ${resp.status}`);
+        }
+        if (!resp.body) {
+          throw new Error("Streaming response body is not available");
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        const appendChat = (q) => {
+          const chunks = q.relevantChunks || [];
+          const isFinal = q.questionId === "final_answer";
+          setChats((prev) => [
+            ...(prev || []),
+            {
+              entered_query: q.question || "",
+              response: q.answer || "",
+              chat_id: q.questionId,
+              questionId: q.questionId,
+              questionType: q.questionType,
+              userIntent: q.userIntent,
+              relevant_chunks: chunks,
+              underlying_model: requestBody.gptModel,
+              source: isFinal ? "final_answer" : "transcript_extracted",
+            },
+          ]);
+        };
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          buffer = buffer.replace(/\r\n/g, "\n");
+
+          const parts = buffer.split("\n\n");
+          buffer = parts.pop() || "";
+
+          for (const part of parts) {
+            const lines = part.split("\n").filter(Boolean);
+            let eventType = "message";
+            let dataStr = "";
+            for (const line of lines) {
+              if (line.startsWith("event:")) {
+                eventType = line.slice(6).trim();
+              } else if (line.startsWith("data:")) {
+                dataStr += line.slice(5).trim();
+              }
+            }
+            if (!dataStr) continue;
+
+            let payload = null;
+            try {
+              payload = JSON.parse(dataStr);
+            } catch (e) {
+              payload = { raw: dataStr };
+            }
+
+            if (eventType === "status") {
+              const stage = payload?.stage;
+              if (stage === "started") {
+                setCallsProgressText("Starting transcript processing…");
+              }
+              if (stage === "conversation_created") {
+                conversationIdFromStream = payload?.conversationId || "";
+                setConversationStatus((payload?.status || "active").toLowerCase());
+                setCallsProgressText("Preparing workspace…");
+              }
+              if (stage === "cached") {
+                // Cached path: answers will stream quickly; still show activity.
+                const convId = payload?.conversationId || "";
+                if (convId) conversationIdFromStream = convId;
+                setConversationStatus((payload?.status || "active").toLowerCase());
+                setCallsProgressText("Loading cached results…");
+              }
+              if (stage === "transcript_loading") {
+                setCallsProgressText("Loading transcript from GCS…");
+              }
+              if (stage === "transcript_loaded") {
+                const fn = payload?.transcriptMetadata?.fileName;
+                if (fn) setCallsTranscriptName(fn);
+                setCallsProgressText("Transcript loaded. Analyzing…");
+              }
+              if (stage === "extracting_questions") {
+                setCallsProgressText("Extracting relevant customer questions…");
+              }
+              if (stage === "questions_ready") {
+                const total = Number(payload?.totalQuestions || 0);
+                setCallsTotalQuestions(total);
+                setCallsAnsweredCount(0);
+                if (payload?.warning) {
+                  setCallsProgressText(`${payload.warning} Generating answer…`);
+                } else {
+                  setCallsProgressText(
+                    total > 0 ? `Found ${total} question(s). Generating answers…` : "Generating answers…"
+                  );
+                }
+              }
+              if (stage === "initializing_retriever") {
+                setCallsProgressText("Loading knowledge base (Milvus)…");
+              }
+              if (stage === "answering") {
+                setCallsProgressText("Generating answers…");
+              }
+              if (stage === "answering_question") {
+                const idx = Number(payload?.index || 0);
+                const total = Number(callsTotalQuestions || payload?.totalQuestions || 0);
+                const label = total > 0 ? `Generating answer ${idx} of ${total}…` : `Generating answer ${idx}…`;
+                setCallsProgressText(label);
+              }
+            } else if (eventType === "answer") {
+              appendChat(payload || {});
+              setCallsAnsweredCount((prev) => {
+                const next = (prev || 0) + 1;
+                const total = callsTotalQuestions || 0;
+                if (total > 0) {
+                  if (next < total) {
+                    setCallsProgressText(`Received answer ${next} of ${total}. Generating next…`);
+                  } else {
+                    setCallsProgressText("Generating final summary…");
+                  }
+                } else {
+                  setCallsProgressText("Generating final summary…");
+                }
+                return next;
+              });
+            } else if (eventType === "final") {
+              setFinalSummary(payload?.finalSummary || "");
+              setCallsProgressText("Final summary ready. Finishing…");
+            } else if (eventType === "claimDecision") {
+              setCallsClaimDecision(payload || null);
+            } else if (eventType === "done") {
+              setCallsGenerationStage("done");
+              setCallsProgressText("");
+              setSidebarRefreshTick((t) => t + 1);
+              if (conversationIdFromStream) {
+                navigate(`/conversation/${conversationIdFromStream}`);
+              }
+            } else if (eventType === "error") {
+              const msg = payload?.error || payload?.message || "Streaming error";
+              throw new Error(msg);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Streaming transcript processing failed, falling back:", err);
+        runNonStreamingFallback();
+      }
+    };
+
+    runStreaming();
   };
 
   const handleSelectTranscript = (transcript) => {
@@ -335,6 +520,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
           setSelectedContract(response.data.contractType);
           setSelectedPlan(response.data.selectedPlan);
           setFinalSummary(response.data.finalSummary || "");
+          setCallsClaimDecision(response?.data?.claimDecision || null);
           setConversationStatus((response.data.status || "active").toLowerCase());
 
           const transcriptNameFromApi =
@@ -367,6 +553,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
       setConversationStatus("active");
       setCallsTranscriptName("");
       setCallsGenerationStage("idle");
+      setCallsClaimDecision(null);
     }
   }, [conversationId]);
 
@@ -680,6 +867,46 @@ const Home = ({ bearerToken, setBearerToken }) => {
                 input={input}
                 setInput={setInput}
               />
+            ) : isCallsMode &&
+              conversationId === "" &&
+              chats.length === 0 &&
+              !callsTranscriptName ? (
+              <div className="calls_intro">
+                <div className="calls_intro_card">
+                  <div className="calls_intro_badge">Calls</div>
+                  <div className="calls_intro_title">
+                    Upload a transcript to get coverage-focused answers
+                  </div>
+                  <div className="calls_intro_subtitle">
+                    In Calls mode, you can pick a call transcript and we will extract the
+                    customer’s key coverage / repair questions, answer them, and include the
+                    supporting chunks used to generate each answer.
+                  </div>
+
+                  <div className="calls_intro_steps">
+                    <div className="calls_intro_step">
+                      <div className="label">1. Add transcript</div>
+                      <div className="text">
+                        Choose a transcript file from the list (searchable + paginated).
+                      </div>
+                    </div>
+                    <div className="calls_intro_step">
+                      <div className="label">2. We process & extract</div>
+                      <div className="text">
+                        We identify atomic, relevant customer questions (coverage, damage,
+                        repair) from the call.
+                      </div>
+                    </div>
+                    <div className="calls_intro_step">
+                      <div className="label">3. Answers + referenced chunks</div>
+                      <div className="text">
+                        Each answer includes the most relevant chunks so you can validate the
+                        result.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             ) : chats.length > 0 || (isCallsMode && callsTranscriptName) ? (
               <div
                 className={`chat_container  ${isScrollable ? "setHeight" : ""}`}
@@ -699,6 +926,36 @@ const Home = ({ bearerToken, setBearerToken }) => {
                           <div className="subtle_hint">Here are your details</div>
                         </>
                       ) : null}
+                    </div>
+                  ) : null}
+                  {isCallsMode && callsClaimDecision ? (
+                    <div className={`calls_decision calls_decision_${(callsClaimDecision.decision || '').toLowerCase()}`}>
+                      <div className="headline">
+                        Decision: <span className="value">{callsClaimDecision.decision}</span>
+                      </div>
+                      {callsClaimDecision.shortAnswer ? (
+                        <div className="short">{callsClaimDecision.shortAnswer}</div>
+                      ) : null}
+                      {Array.isArray(callsClaimDecision.reasons) && callsClaimDecision.reasons.length > 0 ? (
+                        <ul className="reasons">
+                          {callsClaimDecision.reasons.slice(0, 4).map((r, idx) => (
+                            <li key={idx}>{r}</li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      {Array.isArray(callsClaimDecision.citedChunks) && callsClaimDecision.citedChunks.length > 0 ? (
+                        <div className="cite">
+                          Based on {callsClaimDecision.citedChunks.length} policy chunk(s).
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {isCallsMode && callsGenerationStage === "generating" ? (
+                    <div className="calls_progress calls_progress_sticky" aria-live="polite">
+                      <div className="spinner" aria-hidden="true" />
+                      <div className="text">
+                        {callsProgressText || "Generating…"}
+                      </div>
                     </div>
                   ) : null}
                   <ChatList
@@ -723,6 +980,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
                 type="button"
                 className="add_transcript_button"
                 onClick={handleOpenTranscriptModal}
+                disabled={callsGenerationStage === "generating"}
               >
                 Add Transcript
               </button>
