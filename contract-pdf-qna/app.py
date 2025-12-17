@@ -25,7 +25,7 @@ from langchain.memory import ConversationBufferMemory
 # Add imports for transcript processing
 import json
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pathlib import Path
 
 # GCP Storage imports using fsspec (unified filesystem interface)
@@ -193,6 +193,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 mongo_client = MongoClient(MONGO_URI, unicode_decode_error_handler='ignore')
 db = mongo_client["FrontDoorDB"]
 
+# Optional legacy Calls collections (older endpoints). Keep defined to avoid NameError/linter warnings.
+calls_transcripts_collection = db.get_collection("calls_transcripts")
+calls_conversations_collection = db.get_collection("calls_conversations")
+
 model_name = "text-embedding-ada-002"
 embed = OpenAIEmbeddings(model=model_name, openai_api_key=OPENAI_API_KEY)
 
@@ -241,27 +245,10 @@ if GCP_STORAGE_AVAILABLE:
                 print(f"  SSL Certificates: {cert_path}")
                 print(f"  Using Application Default Credentials")
                 
-                # Optional: Test connection (but don't fail if it fails - might be SSL/certificate issues)
-                try:
-                    bucket_path = f"gs://{GCP_BUCKET_NAME}/"
-                    # Try to list files to verify connection
-                    test_files = gcs_fs.ls(bucket_path, detail=False)
-                    print(f"  ✓ Connection test successful - Found {len(test_files)} files in bucket")
-                except Exception as test_error:
-                    # Warning but don't fail - filesystem object is created, might work on actual use
-                    error_msg = str(test_error)
-                    if "SSL" in error_msg or "certificate" in error_msg.lower():
-                        print(f"  ⚠ SSL certificate issue detected (common on macOS)")
-                        print(f"    The filesystem is created and may work despite this warning")
-                        print(f"    If you encounter SSL errors, try:")
-                        print(f"      /Applications/Python\\ 3.13/Install\\ Certificates.command")
-                    else:
-                        print(f"  ⚠ Connection test failed: {test_error}")
-                        print(f"    The filesystem is created and may work on actual use")
-                        print(f"    If issues persist, try:")
-                        print(f"      1. Run: gcloud auth application-default login")
-                        print(f"      2. Set GOOGLE_APPLICATION_CREDENTIALS env variable")
-                        print(f"      3. Set GCP_SERVICE_ACCOUNT_PATH env variable to service account JSON")
+                # NOTE: Do not run a bucket listing "connection test" at import time.
+                # This can block startup (network/auth issues) and prevent the Flask server from ever binding.
+                # We validate GCS access lazily when the first transcript request is made.
+                print("  ✓ Skipping GCS bucket connection test at startup (validated on-demand).")
             except Exception as e:
                 print(f"✗ GCP Storage filesystem creation failed: {e}")
                 print(f"  Options:")
@@ -372,8 +359,27 @@ If the inquiry is unrelated to home repair and service, answer with "I don't hav
 
 """
 
+calls_decision_sys_msg = """
+Calls per-question answering (for extracted questions):
 
-def input_prompt(entered_query, qa, llm):
+You are given a tool named Knowledge Base. Always use it to ground your answer.
+
+Goal:
+- Provide a CSR-friendly, confident answer to the specific question, grounded in retrieved policy.
+- This is a per-question answer only. Do NOT output a final claim decision block per question.
+
+Hard rules:
+- Do NOT output headings like "Decision:", "AuthorizedAmount:", "Why:", "Conditions:".
+- Do NOT say "I cannot confirm", "cannot determine", "insufficient information", or "policy does not mention".
+- If evidence is ambiguous/insufficient, still give a best-effort coverage direction but phrase it as a clear CSR note: "Needs human review" and specify exactly what clause/info is missing.
+
+Style:
+- 1–3 short sentences in plain English.
+- Then 2–4 bullets with policy-grounded rationale (quote/paraphrase from retrieved chunks).
+"""
+
+
+def input_prompt(entered_query, qa, llm, system_message: str = None):
     # Retriever chain as Tool for agent
     knowledge_base_tool = Tool(
         name="Knowledge Base",
@@ -421,7 +427,7 @@ def input_prompt(entered_query, qa, llm):
         return_intermediate_steps=True,
     )
 
-    new_prompt = agent.agent.create_prompt(system_message=sys_msg, tools=tools)
+    new_prompt = agent.agent.create_prompt(system_message=(system_message or sys_msg), tools=tools)
 
     agent.agent.llm_chain.prompt = new_prompt
 
@@ -976,6 +982,175 @@ def read_transcript_file_gcp(file_name: str) -> tuple:
         raise
 
 
+def _clean_calls_transcript_text(raw: str) -> str:
+    """Remove obvious metadata/noise so Calls question extraction doesn't treat it as the 'issue'."""
+    if raw is None:
+        return ""
+    t = str(raw)
+    # Drop common metadata lines that sometimes get embedded in the transcript text payload
+    t = re.sub(r'(?im)^\s*(state|plan|contracttype)\s*=\s*["\']?.+?["\']?\s*$', '', t)
+    t = re.sub(r'(?im)^\s*transcribe\s*:\s*', '', t)
+    t = re.sub(r'(?im)^\s*transcript\s*:\s*', '', t)
+    # Collapse whitespace
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def _split_calls_transcript_into_dispatches(cleaned: str) -> List[Dict]:
+    """
+    Split a Calls transcript into per-dispatch blocks.
+    Works even when no explicit dispatch/work-order ID is present.
+    """
+    s = (cleaned or "").strip()
+    if not s:
+        return []
+
+    start_pat = re.compile(r"(?i)\b(dispatch number|dispatch id|dispatch no\.?|work order|workorder)\b")
+    end_pat = re.compile(
+        r"(?i)\b("
+        r"total authorization|total for authorization|"
+        r"i (?:just )?need to verify i come up with|"
+        r"i come up with\s*\$?\s*\d+(?:\.\d+)?\b"
+        r")"
+    )
+
+    starts = [m.start() for m in start_pat.finditer(s)]
+    ends = [m.end() for m in end_pat.finditer(s)]
+
+    segments: List[str] = []
+    if len(starts) > 1:
+        bounds = starts + [len(s)]
+        for i in range(len(starts)):
+            seg = s[bounds[i] : bounds[i + 1]].strip()
+            if seg:
+                segments.append(seg)
+    elif len(ends) > 1:
+        prev = 0
+        for e in ends:
+            seg = s[prev:e].strip()
+            if seg:
+                segments.append(seg)
+            prev = e
+        tail = s[prev:].strip()
+        if tail:
+            segments.append(tail)
+    else:
+        segments = [s]
+
+    dispatches: List[Dict] = []
+    for idx, seg in enumerate(segments):
+        id_match = re.search(r"(?i)\b(?:RE|DTC)[- ]?\d{6,}\b", seg)
+        if not id_match:
+            id_match = re.search(r"\b\d{8,}\b", seg)  # long numeric IDs (avoid costs)
+        dispatch_id = (id_match.group(0).replace(" ", "-") if id_match else f"AUTO-{idx + 1}")
+        dispatches.append({"dispatch_id": dispatch_id, "text": seg})
+    return dispatches
+
+
+def _is_low_signal_calls_transcript(cleaned: str) -> bool:
+    """Heuristic: transcript doesn't describe any appliance/issue to adjudicate."""
+    if not cleaned:
+        return True
+    s = cleaned.strip().lower()
+    # Very short or greeting-only transcripts are not adjudicable
+    if len(s) < 25:
+        return True
+    if re.fullmatch(r'(hi|hello|hey|good (morning|afternoon|evening))[\.\!\? ]*', s or ""):
+        return True
+    # No issue keywords at all
+    issue_keywords = [
+        "not working", "doesn't work", "stopped", "broken", "leak", "leaking", "noise", "smell",
+        "won't", "won’t", "fail", "failed", "issue", "problem", "repair", "replace", "coverage",
+        "covered", "claim", "service", "diagnos", "water heater", "refrigerator", "fridge", "ac",
+        "air conditioner", "dishwasher", "washer", "dryer", "oven", "stove", "microwave", "toilet",
+        "plumbing", "electrical",
+    ]
+    if not any(k in s for k in issue_keywords):
+        return True
+    return False
+
+
+def _calls_low_signal_response(contract_type: str, selected_plan: str, selected_state: str) -> dict:
+    """Deterministic CSR-ready output when the transcript doesn't contain an adjudicable issue."""
+    claim_decision = {
+        "decision": "SEND_FOR_HUMAN_REVIEW",
+        "shortAnswer": "Needs human review. The transcript does not describe a clear appliance/system issue to match against coverage.",
+        "reasons": [
+            "Transcript content is too minimal to identify the appliance/system, failure mode, and requested service.",
+            f"Plan context: contractType={contract_type}, plan={selected_plan}, state={selected_state}.",
+        ],
+        "citedChunks": [],
+        "authorizedAmount": "Up to plan limit (pending review)",
+        "confidence": 0.25,
+    }
+    final_summary = (
+        "Final Summary (Calls)\n"
+        f"- Plan: {contract_type} / {selected_plan} / {selected_state}\n"
+        "- Outcome: SEND_FOR_HUMAN_REVIEW\n"
+        "- Why: Transcript is low-signal and does not contain enough details (item + issue + requested service) to adjudicate.\n"
+        "- CSR next steps: confirm the appliance/system, exact symptoms/failure, where it occurred, when it started, and what service is requested. Then re-run.\n"
+    )
+    return {"claimDecision": claim_decision, "finalSummary": final_summary}
+
+
+def _calls_no_questions_extracted_response(contract_type: str, selected_plan: str, selected_state: str) -> dict:
+    """Deterministic CSR-ready output when extraction yields no questions."""
+    claim_decision = {
+        "decision": "SEND_FOR_HUMAN_REVIEW",
+        "shortAnswer": "Needs human review. No coverage questions could be extracted from the transcript.",
+        "reasons": [
+            "Question extraction returned zero usable customer-specific questions.",
+            f"Plan context: contractType={contract_type}, plan={selected_plan}, state={selected_state}.",
+        ],
+        "citedChunks": [],
+        "authorizedAmount": "Up to plan limit (pending review)",
+        "confidence": 0.3,
+    }
+    final_summary = (
+        "Final Summary (Calls)\n"
+        f"- Plan: {contract_type} / {selected_plan} / {selected_state}\n"
+        "- Outcome: SEND_FOR_HUMAN_REVIEW\n"
+        "- Why: No questions were extracted, so we cannot map the call to coverage clauses.\n"
+        "- CSR next steps: capture the appliance/system and the exact issue/service requested, then re-run Calls.\n"
+    )
+    return {"claimDecision": claim_decision, "finalSummary": final_summary}
+
+
+def _sanitize_calls_per_question_answer(answer_text: str) -> str:
+    """Strip legacy decision-style formatting from per-question answers and convert to CSR-friendly text."""
+    if answer_text is None:
+        return ""
+    text = str(answer_text).strip()
+    if not text:
+        return ""
+
+    # If the model returned decision-format, convert it.
+    m = re.search(r"(?im)^\s*Decision\s*:\s*(APPROVED|REJECTED)\b", text)
+    if m:
+        decision = m.group(1).upper()
+        opener = "Covered." if decision == "APPROVED" else "Not covered."
+
+        why_match = re.search(r"(?is)\bWhy\s*:\s*(.+?)(?:\n\s*-\s*Conditions\s*:|\n\s*Conditions\s*:|$)", text)
+        why = (why_match.group(1).strip() if why_match else "").strip(" -\n\t")
+        # Collapse to a couple bullets if we can.
+        bullets = []
+        if why:
+            # Split on "- " if present, else sentence-split lightly.
+            if re.search(r"(?m)^\s*-\s+", why):
+                bullets = [re.sub(r"^\s*-\s*", "", ln).strip() for ln in why.splitlines() if ln.strip().startswith("-")]
+            else:
+                bullets = [s.strip() for s in re.split(r"(?<=[.!?])\s+", why) if s.strip()]
+        bullets = bullets[:4]
+        if bullets:
+            return opener + "\n" + "\n".join([f"- {b}" for b in bullets])
+        return opener
+
+    # Otherwise just remove any stray headings if present.
+    text = re.sub(r"(?im)^\s*(Decision|AuthorizedAmount|Authorized Amount|Why|Conditions)\s*:\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def filter_relevant_customer_questions(questions: List[Dict]) -> List[Dict]:
     """
     Filter questions to keep only relevant customer questions related to coverage, damage, repair, or customer problems.
@@ -1129,7 +1304,7 @@ def extract_relevant_customer_questions(transcript_content: str, llm) -> List[Di
         
         # Apply post-extraction filtering for additional safety
         questions = filter_relevant_customer_questions(questions)
-        
+
         # Add question IDs
         for idx, q in enumerate(questions):
             q["questionId"] = f"q{idx + 1}"
@@ -1179,11 +1354,23 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
         - Focuses on coverage, damage, repair, policy, and any clarifiers needed to resolve the issue
         - If no explicit questions are present, infer and create them. Ensure at least one question per described issue.
 
+        HARD REQUIREMENTS (Calls mode):
+        - Do NOT write generic questions like "Is it covered?", "Is this covered?", "Is that covered?" or "Is it covered or not?".
+        - Every question must be CUSTOMER-SPECIFIC: explicitly mention the appliance/system and the specific issue/service (symptom/part/service).
+        - Avoid vague pronouns ("it/this/that") unless you immediately clarify the appliance/issue in the same sentence.
+        - Generate a compact but complete set of questions that covers WH-style checks as QUESTIONS when implied by the case:
+          - What failed / what service is needed
+          - Where (location / affected area / on/off premises when relevant)
+          - When (timing, waiting period, recent repair when relevant)
+          - Why (suspected cause, secondary damage, misuse/commercial use when relevant)
+          - How (repair vs replace, diagnostics, service call/trade call, limits/fees)
+        - Keep questions clean and professional; no filler, no disclaimers.
+
         Question types to frame:
-        1. Coverage questions: "Is [specific item/issue] covered under my plan?"
-        2. Damage/repair questions: "Will you repair [specific problem]?" or "Is [specific damage] covered?"
+        1. Coverage questions (contextual): "Does my plan cover diagnosing/repairing/replacing [appliance/part] for [specific failure mode]?"
+        2. Damage/repair questions (contextual): "Does the plan cover [specific repair/service] for [specific damage/failure] and under what limits/fees?"
         3. Policy/limit questions: "What is the [specific limit/policy] for [item]?"
-        4. Problem statements: Convert customer problems into questions like "Is [problem description] covered?"
+        4. Problem statements: Convert customer problems into questions that include appliance + failure mode + requested service.
         5. Clarifying questions that help resolve the customer’s need (e.g., specifics about the item, location, cause, or limits that determine coverage)
 
         STEP 3: EXTRACT AND RETRIEVE
@@ -1200,8 +1387,8 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
         Return ONLY a JSON array of relevant customer questions in this format:
         [
             {{
-                "question": "Is the water heater leak covered under my plan?",
-                "context": "Customer mentioned their water heater tank is leaking and causing floor damage. Customer wants to know if this specific leak is covered.",
+                "question": "Does my plan cover diagnosing and repairing my water heater tank leak described in the transcript, including any covered parts/labor and applicable fees?",
+                "context": "Customer mentioned their water heater tank is leaking and causing floor damage; customer wants to know coverage for the leak and related service",
                 "questionType": "coverage",
                 "userIntent": "Customer wants to understand if the water heater leak they're experiencing is covered by their plan"
             }},
@@ -1362,19 +1549,6 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
         questions = filter_relevant_customer_questions(questions)
         print(f"DEBUG: After filtering: {len(questions)} questions")
         
-        # If no questions after agent extraction, try direct extraction as fallback
-        if not questions or len(questions) == 0:
-            print(f"DEBUG: Agent extraction returned no questions, trying direct extraction method...")
-            try:
-                direct_questions = extract_relevant_customer_questions(transcript_content, llm)
-                if direct_questions and len(direct_questions) > 0:
-                    print(f"DEBUG: Direct extraction found {len(direct_questions)} questions")
-                    return direct_questions
-                else:
-                    print(f"DEBUG: Direct extraction also returned no questions")
-            except Exception as fallback_err:
-                print(f"DEBUG: Direct extraction fallback failed: {fallback_err}")
-        
         # Add question IDs
         for idx, q in enumerate(questions):
             q["questionId"] = f"q{idx + 1}"
@@ -1384,24 +1558,12 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
     except json.JSONDecodeError as e:
         print(f"ERROR: JSON parsing failed in agent extraction: {e}")
         print(f"ERROR: Result text (first 1000 chars): {result_text[:1000] if 'result_text' in locals() else 'N/A'}")
-        print(f"ERROR: Falling back to direct extraction method...")
-        # Fallback to direct extraction if agent fails
-        try:
-            return extract_relevant_customer_questions(transcript_content, llm)
-        except Exception as fallback_err:
-            print(f"ERROR: Fallback extraction also failed: {fallback_err}")
-            return []
+        return []
     except Exception as e:
         print(f"ERROR: Exception in agent extraction: {e}")
         import traceback
         traceback.print_exc()
-        print(f"ERROR: Falling back to direct extraction method...")
-        # Fallback to direct extraction if agent fails
-        try:
-            return extract_relevant_customer_questions(transcript_content, llm)
-        except Exception as fallback_err:
-            print(f"ERROR: Fallback extraction also failed: {fallback_err}")
-            return []
+        return []
 
 
 def extract_atomic_questions(transcript_content: str, llm) -> List[Dict]:
@@ -1519,8 +1681,8 @@ def process_single_transcript_question(question: str, contract_type: str, select
         elif gpt_model == "Infer":
             print("[CHUNKS] process_single_transcript_question: building QA chain (Infer)")
             qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, verbose=True)
-            agent_response = input_prompt(standalone_result, qa, llm)
-            answer = agent_response["output"]
+            agent_response = input_prompt(standalone_result, qa, llm, system_message=calls_decision_sys_msg)
+            answer = _sanitize_calls_per_question_answer(agent_response["output"])
             print(
                 "[CHUNKS] process_single_transcript_question: agent_response received "
                 f"answer_len={len(str(answer))}"
@@ -2394,8 +2556,9 @@ def chat_history():
             # For transcript conversations we store a conversation-level mode (e.g. "Calls")
             # while still keeping the underlying model per chat for backend execution.
             "gptModel": docs.get("conversation_mode") or (chats[0].get("gpt_model") if chats else None),
-            "finalSummary": docs.get("final_summary"),
-            "claimDecision": docs.get("claim_decision"),
+            # Calls transcripts: classic outputs
+            "claimDecision": docs.get("claimDecision") or {},
+            "finalSummary": docs.get("finalSummary") or "",
             "transcriptId": docs.get("transcript_id"),
             "transcriptMetadata": docs.get("transcript_metadata"),
         }
@@ -3235,14 +3398,17 @@ def _sse(event: str, data: dict) -> str:
 
 def generate_claim_decision_from_chunks(chunks: List[str], llm=None) -> Dict:
     """
-    Produce a single claim authorization decision grounded ONLY in provided policy chunks.
+    Produce a single authorization/coverage decision grounded primarily in provided policy chunks,
+    using the case_blob only to understand what the user is asking for.
 
     Returns:
       {
-        "decision": "APPROVED"|"REJECTED"|"CANNOT_DETERMINE",
+        "decision": "APPROVED"|"REJECTED",
         "shortAnswer": "...",
         "reasons": ["...", "..."],
-        "citedChunks": ["...", "..."]
+        "citedChunks": ["...", "..."],
+        "authorizedAmount": "string (ex: '$1500' or 'Up to plan limit')",
+        "confidence": 0.0-1.0
       }
     """
     cleaned = [str(c).strip() for c in (chunks or []) if str(c).strip()]
@@ -3251,34 +3417,41 @@ def generate_claim_decision_from_chunks(chunks: List[str], llm=None) -> Dict:
 
     if not cleaned:
         return {
-            "decision": "CANNOT_DETERMINE",
-            "shortAnswer": "I can’t confirm approval or rejection from the policy text provided.",
-            "reasons": ["No relevant policy clauses were retrieved to support a decision."],
+            "decision": "APPROVED",
+            "shortAnswer": "Approved (pending human review). No policy clauses were retrieved, so this is a best-effort recommendation.",
+            "reasons": ["Proceeding with a provisional approval while awaiting human validation of the applicable policy clauses."],
             "citedChunks": [],
+            "authorizedAmount": "Up to plan limit (pending review)",
+            "confidence": 0.35,
         }
 
     try:
         if llm is None:
             llm = ChatOpenAI(temperature=0.0, model="gpt-4o-mini")
 
+        # NOTE: ChatPromptTemplate uses `{var}` for interpolation. Any literal JSON braces must be escaped as `{{` and `}}`.
         prompt = ChatPromptTemplate.from_template(
             """
-You are a claim authorization assistant. Decide whether the claim should be APPROVED, REJECTED, or CANNOT_DETERMINE.
+You are a claims authorization decision maker. Decide whether the claim should be APPROVED or REJECTED.
 
 CRITICAL RULES:
 - Use ONLY the policy chunks provided below as evidence.
 - Do NOT assume anything not explicitly stated in the chunks.
-- If the chunks are insufficient/ambiguous to decide, output CANNOT_DETERMINE.
-- Keep the language short and human (customer-friendly).
-- Provide 2 to 4 short reasons. Each reason must clearly map to a clause in the chunks.
+- If the chunks are insufficient/ambiguous, still choose APPROVED (pending human review) unless there is explicit exclusion language that requires REJECTED.
+- Keep the language short, decisive, and suitable for a claim authorization note.
+- Provide 2 to 4 short reasons. Each reason must clearly map to a clause in the chunks (quote/paraphrase).
 - Also return citedChunks: include only the 1–3 chunk strings you relied on most.
+- Extract any explicit dollar limits/fees from the chunks into authorizedAmount (examples: "$1500 max", "$100 trade call fee"). If no dollar amount exists, set authorizedAmount to "Up to plan limit".
+- Provide a confidence from 0.0 to 1.0 based on strength/clarity of cited chunks.
 
 Return ONLY valid JSON in exactly this schema:
 {{
-  "decision": "APPROVED|REJECTED|CANNOT_DETERMINE",
+  "decision": "APPROVED|REJECTED",
   "shortAnswer": "one sentence",
   "reasons": ["reason1","reason2"],
-  "citedChunks": ["chunk1","chunk2"]
+  "citedChunks": ["chunk1","chunk2"],
+  "authorizedAmount": "string",
+  "confidence": 0.0
 }}
 
 Policy chunks:
@@ -3295,18 +3468,18 @@ Policy chunks:
         data = json.loads(raw)
 
         decision = (data.get("decision") or "").strip().upper()
-        if decision not in ("APPROVED", "REJECTED", "CANNOT_DETERMINE"):
-            decision = "CANNOT_DETERMINE"
+        if decision not in ("APPROVED", "REJECTED"):
+            decision = "APPROVED"
         short_answer = (data.get("shortAnswer") or "").strip()
         reasons = data.get("reasons") or []
         cited = data.get("citedChunks") or []
-
+        authorized_amount = (data.get("authorizedAmount") or "").strip()
+        confidence = data.get("confidence")
         if not isinstance(reasons, list):
             reasons = []
         reasons = [str(r).strip() for r in reasons if str(r).strip()][:4]
         if not reasons:
-            reasons = ["The provided policy text is not sufficient to justify a clear decision."]
-            decision = "CANNOT_DETERMINE"
+            reasons = ["Proceeding with a best-effort decision based on the most relevant available clauses."]
 
         if not isinstance(cited, list):
             cited = []
@@ -3319,26 +3492,249 @@ Policy chunks:
 
         if not short_answer:
             if decision == "APPROVED":
-                short_answer = "Your claim appears approved based on the policy clauses provided."
+                short_answer = "Approved based on the cited policy clauses (pending human review)."
             elif decision == "REJECTED":
-                short_answer = "Your claim appears rejected based on the policy clauses provided."
-            else:
-                short_answer = "I can’t confirm approval or rejection from the policy text provided."
+                short_answer = "Rejected based on the cited policy clauses (pending human review)."
+
+        if not authorized_amount:
+            authorized_amount = "Up to plan limit"
+        else:
+            # Keep it short
+            authorized_amount = authorized_amount[:120]
+
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.6 if cited else 0.35
+        confidence = max(0.0, min(1.0, confidence))
 
         return {
             "decision": decision,
             "shortAnswer": short_answer,
             "reasons": reasons,
             "citedChunks": cited,
+            "authorizedAmount": authorized_amount,
+            "confidence": confidence,
         }
     except Exception as e:
         print(f"Warning: claim decision generation failed: {e}")
         return {
-            "decision": "CANNOT_DETERMINE",
-            "shortAnswer": "I can’t confirm approval or rejection from the policy text provided.",
-            "reasons": ["The system could not generate a grounded decision from the retrieved clauses."],
+            "decision": "APPROVED",
+            "shortAnswer": "Approved (pending human review). The system could not generate a structured decision from the retrieved clauses.",
+            "reasons": ["Proceeding with a provisional approval while awaiting human validation of the applicable policy clauses."],
             "citedChunks": cleaned[:2],
+            "authorizedAmount": "Up to plan limit (pending review)",
+            "confidence": 0.35,
         }
+
+
+def generate_claim_decision_from_qa(qa_blob: str, llm=None, cited_chunks: List[str] = None) -> Dict:
+    """
+    Produce a single authorization/coverage decision derived from the Transcript Q/A.
+    This is preferred for Calls transcripts because per-question answers are already grounded in policy retrieval.
+
+    Returns:
+      {
+        "decision": "APPROVED"|"REJECTED"|"SEND_FOR_HUMAN_REVIEW",
+        "shortAnswer": "...",
+        "reasons": ["...", "..."],
+        "citedChunks": ["...", "..."],   # optional: best-effort, may be empty
+        "authorizedAmount": "string",
+        "confidence": 0.0-1.0
+      }
+    """
+    qa_blob = (qa_blob or "").strip()
+    cited_chunks = [str(c).strip() for c in (cited_chunks or []) if str(c).strip()]
+
+    if not qa_blob:
+        # No Q/A to adjudicate. Keep it review-oriented.
+        return {
+            "decision": "SEND_FOR_HUMAN_REVIEW",
+            "shortAnswer": "Needs human review. No Q/A was available to derive a final authorization recommendation.",
+            "reasons": ["Transcript processing did not yield any usable question/answer pairs."],
+            "citedChunks": cited_chunks[:2],
+            "authorizedAmount": "Up to plan limit (pending review)",
+            "confidence": 0.25,
+        }
+
+    try:
+        if llm is None:
+            llm = ChatOpenAI(temperature=0.0, model="gpt-4o-mini")
+
+        # NOTE: ChatPromptTemplate uses `{var}` for interpolation. Any literal JSON braces must be escaped as `{{` and `}}`.
+        prompt = ChatPromptTemplate.from_template(
+            """
+You are an AHS CLAIM AUTHORIZATION DECISION MAKER for Calls.
+Derive the final decision from the Transcript Q/A below (customer intent + answers).
+
+Rules:
+- Base your decision primarily on the ANSWERS. The answers are grounded in policy retrieval.
+- If answers are consistently positive for covered items -> APPROVED.
+- If answers are consistently negative for non-covered items -> REJECTED.
+- If answers are mixed, conflicted, or unclear -> SEND_FOR_HUMAN_REVIEW (still provide a clear recommendation + why).
+- Do NOT use "cannot determine/cannot confirm/insufficient information". Use "Needs human review" with specific missing evidence instead.
+- authorizedAmount: extract any explicit dollar limits/fees/totals mentioned in the answers; if none, set "Up to plan limit".
+- Provide 3-6 short reasons in CSR language (derived from answers). Do not paste the entire Q/A.
+- confidence: 0.0 to 1.0 based on how consistent/clear the Q/A is.
+
+Return ONLY valid JSON in exactly this schema:
+{{
+  "decision": "APPROVED|REJECTED|SEND_FOR_HUMAN_REVIEW",
+  "shortAnswer": "one sentence",
+  "reasons": ["reason1","reason2","reason3"],
+  "authorizedAmount": "string",
+  "confidence": 0.0
+}}
+
+Transcript Q/A:
+{qa_blob}
+"""
+        )
+
+        chain = prompt | llm | StrOutputParser()
+        raw = (chain.invoke({"qa_blob": qa_blob}) or "").strip()
+        raw = re.sub(r"```json\\n?", "", raw)
+        raw = re.sub(r"```\\n?", "", raw)
+        raw = raw.strip()
+        data = json.loads(raw)
+
+        decision = (data.get("decision") or "").strip().upper()
+        if decision not in ("APPROVED", "REJECTED", "SEND_FOR_HUMAN_REVIEW"):
+            decision = "SEND_FOR_HUMAN_REVIEW"
+
+        short_answer = (data.get("shortAnswer") or "").strip()
+        reasons = data.get("reasons") or []
+        authorized_amount = (data.get("authorizedAmount") or "").strip()
+        confidence = data.get("confidence")
+
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons = [str(r).strip() for r in reasons if str(r).strip()][:6]
+        if not reasons:
+            reasons = ["Decision derived from the transcript Q/A (pending human review)."]
+
+        if not short_answer:
+            if decision == "APPROVED":
+                short_answer = "Approved based on the transcript Q/A (pending human review)."
+            elif decision == "REJECTED":
+                short_answer = "Rejected based on the transcript Q/A (pending human review)."
+            else:
+                short_answer = "Needs human review based on the transcript Q/A."
+
+        if not authorized_amount:
+            authorized_amount = "Up to plan limit"
+        else:
+            authorized_amount = authorized_amount[:120]
+
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.6
+        confidence = max(0.0, min(1.0, confidence))
+
+        return {
+            "decision": decision,
+            "shortAnswer": short_answer,
+            "reasons": reasons,
+            "citedChunks": cited_chunks[:3],
+            "authorizedAmount": authorized_amount,
+            "confidence": confidence,
+        }
+    except Exception as e:
+        print(f"Warning: QA-based claim decision generation failed: {e}")
+        return {
+            "decision": "SEND_FOR_HUMAN_REVIEW",
+            "shortAnswer": "Needs human review. The system could not generate a structured decision from the transcript Q/A.",
+            "reasons": ["Proceeding with a human review request while preserving the extracted Q/A context."],
+            "citedChunks": cited_chunks[:2],
+            "authorizedAmount": "Up to plan limit (pending review)",
+            "confidence": 0.3,
+        }
+
+
+def generate_calls_final_summary(
+    qa_blob: str,
+    claim_decision: Optional[Dict] = None,
+    contract_type: Optional[str] = None,
+    selected_plan: Optional[str] = None,
+    selected_state: Optional[str] = None,
+    llm=None,
+) -> str:
+    """
+    Create a single human-readable final summary for Calls transcript processing.
+    This is intentionally NOT the adjudication dashboard; it's the classic one-block summary shown at the end.
+    """
+    qa_blob = (qa_blob or "").strip()
+    claim_decision = claim_decision or {}
+
+    # Deterministic fallback (no LLM)
+    if not qa_blob:
+        decision = (claim_decision.get("decision") or "SEND_FOR_HUMAN_REVIEW")
+        return (
+            "Final Summary (Calls)\n"
+            f"- Plan: {contract_type} / {selected_plan} / {selected_state}\n"
+            f"- Outcome: {decision}\n"
+            "- Summary: No transcript Q/A was available to generate a coverage summary.\n"
+        )
+
+    try:
+        if llm is None:
+            llm = ChatOpenAI(temperature=0.0, model="gpt-4o-mini")
+
+        prompt = ChatPromptTemplate.from_template(
+            """
+You are writing the FINAL SUMMARY for a Calls transcript in a CSR-friendly style.
+
+Requirements:
+- Output plain text (no JSON).
+- Do NOT include the original questions verbatim.
+- Summarize the customer issue(s) and what the policy-grounded answers indicate.
+- Include the final recommendation from claimDecision.
+- Keep it compact and actionable (6-12 lines).
+
+Plan context:
+- contractType: {contract_type}
+- plan: {selected_plan}
+- state: {selected_state}
+
+claimDecision (JSON):
+{claim_decision_json}
+
+Transcript Q/A (policy-grounded):
+{qa_blob}
+"""
+        )
+
+        chain = prompt | llm | StrOutputParser()
+        out = (chain.invoke(
+            {
+                "contract_type": contract_type or "",
+                "selected_plan": selected_plan or "",
+                "selected_state": selected_state or "",
+                "claim_decision_json": json.dumps(claim_decision, ensure_ascii=False),
+                "qa_blob": qa_blob,
+            }
+        ) or "").strip()
+        return out[:4000].strip()
+    except Exception as e:
+        print(f"Warning: final summary generation failed: {e}")
+        decision = (claim_decision.get("decision") or "SEND_FOR_HUMAN_REVIEW")
+        short = (claim_decision.get("shortAnswer") or "").strip()
+        reasons = claim_decision.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons = [str(r).strip() for r in reasons if str(r).strip()][:4]
+        lines = [
+            "Final Summary (Calls)",
+            f"- Plan: {contract_type} / {selected_plan} / {selected_state}",
+            f"- Outcome: {decision}",
+        ]
+        if short:
+            lines.append(f"- Summary: {short}")
+        if reasons:
+            lines.append("- Key reasons:")
+            lines.extend([f"  - {r}" for r in reasons])
+        return "\n".join(lines)
 
 
 @app.route("/transcripts/process/stream", methods=["POST"])
@@ -3403,6 +3799,10 @@ def process_transcript_stream():
             contract_type_norm = normalize_contract_type(contract_type)
             selected_plan_norm = normalize_plan_for_milvus(contract_type_norm, selected_plan)
             gpt_model = data.get("gptModel", "Search")
+            # Transcript processing supports only Search/Infer. If the client sends "Calls"
+            # (UI mode label) or anything unexpected, normalize to Infer so Calls always reasons.
+            if gpt_model not in ("Search", "Infer"):
+                gpt_model = "Infer"
             extract_questions = data.get("extractQuestions", True)
             provided_questions = data.get("questions", [])
             force_reprocess = bool(data.get("forceReprocess", False))
@@ -3478,12 +3878,22 @@ def process_transcript_stream():
                         },
                     )
 
-                if isinstance(cached.get("claimDecision"), dict):
-                    yield _sse("claimDecision", cached.get("claimDecision"))
-
-                final_summary = cached.get("finalSummary") or ""
-                yield _sse("final", {"finalSummary": final_summary})
-                yield _sse("done", {"elapsedSec": round(time() - start_time, 2)})
+                yield _sse(
+                    "final",
+                    {
+                        "finalSummary": cached.get("finalSummary") or "",
+                        "claimDecision": cached.get("claimDecision") or {},
+                    },
+                )
+                yield _sse(
+                    "done",
+                    {
+                        "elapsedSec": round(time() - start_time, 2),
+                        "conversationId": str(conv_doc_id),
+                        "conversationName": existing_conv.get("conversation_name") or "",
+                        "status": (existing_conv.get("status") or "active"),
+                    },
+                )
                 return
 
             # Create / update a processing transcript conversation doc early (same as /transcripts/process)
@@ -3551,6 +3961,7 @@ def process_transcript_stream():
                     )
             except Exception:
                 transcript_text = transcript_content
+            transcript_text = _clean_calls_transcript_text(transcript_text)
 
             yield _sse(
                 "status",
@@ -3564,39 +3975,248 @@ def process_transcript_stream():
                 },
             )
 
-            # Extract questions
+            # If transcript is empty/low-signal, return a deterministic summary + decision (no dashboard).
+            if not (transcript_text or "").strip():
+                extraction_warning = "Transcript is empty after cleaning."
+                payload = _calls_no_questions_extracted_response(contract_type, selected_plan, selected_state)
+                yield _sse("status", {"stage": "questions_ready", "totalQuestions": 0, "warning": extraction_warning})
+                yield _sse("final", payload)
+                # Persist minimal transcript conversation result
+                try:
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$set": {
+                                "processing": False,
+                                "updated_at": datetime.utcnow(),
+                                "finalSummary": payload.get("finalSummary", ""),
+                                "claimDecision": payload.get("claimDecision") or {},
+                                "transcript_metadata": {
+                                    "fileName": file_metadata.get("fileName"),
+                                    "uploadDate": file_metadata.get("uploadDate"),
+                                    "fileSize": file_metadata.get("fileSize"),
+                                },
+                                "response_payload": {
+                                    "conversationId": str(conv_doc_id),
+                                    "conversationName": conv_name or "",
+                                    "status": transcript_status,
+                                    "transcriptId": transcript_id,
+                                    "transcriptMetadata": {
+                                        "fileName": file_metadata.get("fileName"),
+                                        "uploadDate": file_metadata.get("uploadDate"),
+                                        "fileSize": file_metadata.get("fileSize"),
+                                    },
+                                    "questions": [],
+                                    "claimDecision": payload.get("claimDecision") or {},
+                                    "finalSummary": payload.get("finalSummary", ""),
+                                    "summary": {
+                                        "totalQuestions": 0,
+                                        "processedQuestions": 0,
+                                        "averageConfidence": 0.0,
+                                        "totalLatency": 0.0,
+                                    },
+                                    "warning": extraction_warning,
+                                },
+                            }
+                        },
+                    )
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$push": {
+                                "chats": {
+                                    "chat_id": "final_answer",
+                                    "entered_query": "Final Answer for transcript",
+                                    "response": payload.get("finalSummary", ""),
+                                    "relevant_chunks": [],
+                                    "relevant_docs": "",
+                                    "gpt_model": "Calls",
+                                    "underlying_model": gpt_model,
+                                    "chat_timestamp": datetime.utcnow(),
+                                    "latency": 0.0,
+                                    "confidence": 0.0,
+                                }
+                            }
+                        },
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to persist empty transcript result: {e}")
+                yield _sse(
+                    "done",
+                    {
+                        "elapsedSec": round(time() - start_time, 2),
+                        "conversationId": str(conv_doc_id),
+                        "conversationName": conv_name or "",
+                        "status": transcript_status,
+                    },
+                )
+                return
+
+            if _is_low_signal_calls_transcript(transcript_text):
+                extraction_warning = "Transcript is low-signal for coverage adjudication."
+                payload = _calls_low_signal_response(contract_type, selected_plan, selected_state)
+                yield _sse("status", {"stage": "questions_ready", "totalQuestions": 0, "warning": extraction_warning})
+                yield _sse("final", payload)
+                try:
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$set": {
+                                "processing": False,
+                                "updated_at": datetime.utcnow(),
+                                "finalSummary": payload.get("finalSummary", ""),
+                                "claimDecision": payload.get("claimDecision") or {},
+                                "transcript_metadata": {
+                                    "fileName": file_metadata.get("fileName"),
+                                    "uploadDate": file_metadata.get("uploadDate"),
+                                    "fileSize": file_metadata.get("fileSize"),
+                                },
+                                "response_payload": {
+                                    "conversationId": str(conv_doc_id),
+                                    "conversationName": conv_name or "",
+                                    "status": transcript_status,
+                                    "transcriptId": transcript_id,
+                                    "transcriptMetadata": {
+                                        "fileName": file_metadata.get("fileName"),
+                                        "uploadDate": file_metadata.get("uploadDate"),
+                                        "fileSize": file_metadata.get("fileSize"),
+                                    },
+                                    "questions": [],
+                                    "claimDecision": payload.get("claimDecision") or {},
+                                    "finalSummary": payload.get("finalSummary", ""),
+                                    "summary": {
+                                        "totalQuestions": 0,
+                                        "processedQuestions": 0,
+                                        "averageConfidence": 0.0,
+                                        "totalLatency": 0.0,
+                                    },
+                                    "warning": extraction_warning,
+                                },
+                            }
+                        },
+                    )
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$push": {
+                                "chats": {
+                                    "chat_id": "final_answer",
+                                    "entered_query": "Final Answer for transcript",
+                                    "response": payload.get("finalSummary", ""),
+                                    "relevant_chunks": [],
+                                    "relevant_docs": "",
+                                    "gpt_model": "Calls",
+                                    "underlying_model": gpt_model,
+                                    "chat_timestamp": datetime.utcnow(),
+                                    "latency": 0.0,
+                                    "confidence": 0.0,
+                                }
+                            }
+                        },
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to persist low-signal transcript result: {e}")
+                yield _sse(
+                    "done",
+                    {
+                        "elapsedSec": round(time() - start_time, 2),
+                        "conversationId": str(conv_doc_id),
+                        "conversationName": conv_name or "",
+                        "status": transcript_status,
+                    },
+                )
+                return
+
             extraction_warning = None
-            questions = []
+            questions: List[Dict] = []
+
             if extract_questions:
                 yield _sse("status", {"stage": "extracting_questions"})
                 llm_extract = ChatOpenAI(temperature=0.0, model="gpt-4o")
-                questions = extract_relevant_customer_questions(transcript_text, llm_extract)
-                if not questions:
-                    questions = extract_questions_with_agent(transcript_text, llm_extract)
-                if not questions:
-                    extraction_warning = "No questions could be extracted from transcript; inferring from context."
-                    inferred_question = {
-                        "question": f"Is this issue covered: {transcript_text[:120]}",
-                        "context": transcript_text[:400],
-                        "questionType": "coverage",
-                        "userIntent": "Customer wants to know if the described issue is covered",
-                        "questionId": "q1",
-                    }
-                    questions = [inferred_question]
+                questions = extract_questions_with_agent(transcript_text, llm_extract) or []
             else:
-                questions = provided_questions
-                if not questions:
+                if not provided_questions:
                     yield _sse("error", {"error": "No questions provided"})
                     return
+                questions = provided_questions
 
-            yield _sse(
-                "status",
-                {
-                    "stage": "questions_ready",
-                    "totalQuestions": len(questions),
-                    "warning": extraction_warning,
-                },
-            )
+            total_q = len(questions or [])
+            if total_q == 0:
+                extraction_warning = "No questions extracted from transcript."
+                payload = _calls_no_questions_extracted_response(contract_type, selected_plan, selected_state)
+                yield _sse("status", {"stage": "questions_ready", "totalQuestions": 0, "warning": extraction_warning})
+                yield _sse("final", payload)
+                try:
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$set": {
+                                "processing": False,
+                                "updated_at": datetime.utcnow(),
+                                "finalSummary": payload.get("finalSummary", ""),
+                                "claimDecision": payload.get("claimDecision") or {},
+                                "transcript_metadata": {
+                                    "fileName": file_metadata.get("fileName"),
+                                    "uploadDate": file_metadata.get("uploadDate"),
+                                    "fileSize": file_metadata.get("fileSize"),
+                                },
+                                "response_payload": {
+                                    "conversationId": str(conv_doc_id),
+                                    "conversationName": conv_name or "",
+                                    "status": transcript_status,
+                                    "transcriptId": transcript_id,
+                                    "transcriptMetadata": {
+                                        "fileName": file_metadata.get("fileName"),
+                                        "uploadDate": file_metadata.get("uploadDate"),
+                                        "fileSize": file_metadata.get("fileSize"),
+                                    },
+                                    "questions": [],
+                                    "claimDecision": payload.get("claimDecision") or {},
+                                    "finalSummary": payload.get("finalSummary", ""),
+                                    "summary": {
+                                        "totalQuestions": 0,
+                                        "processedQuestions": 0,
+                                        "averageConfidence": 0.0,
+                                        "totalLatency": 0.0,
+                                    },
+                                    "warning": extraction_warning,
+                                },
+                            }
+                        },
+                    )
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$push": {
+                                "chats": {
+                                    "chat_id": "final_answer",
+                                    "entered_query": "Final Answer for transcript",
+                                    "response": payload.get("finalSummary", ""),
+                                    "relevant_chunks": [],
+                                    "relevant_docs": "",
+                                    "gpt_model": "Calls",
+                                    "underlying_model": gpt_model,
+                                    "chat_timestamp": datetime.utcnow(),
+                                    "latency": 0.0,
+                                    "confidence": 0.0,
+                                }
+                            }
+                        },
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to persist no-questions transcript result: {e}")
+                yield _sse(
+                    "done",
+                    {
+                        "elapsedSec": round(time() - start_time, 2),
+                        "conversationId": str(conv_doc_id),
+                        "conversationName": conv_name or "",
+                        "status": transcript_status,
+                    },
+                )
+                return
+
+            yield _sse("status", {"stage": "questions_ready", "totalQuestions": total_q, "warning": extraction_warning})
 
             # Initialize vector DB + LLMs
             yield _sse("status", {"stage": "initializing_retriever"})
@@ -3636,18 +4256,17 @@ def process_transcript_stream():
             yield _sse("status", {"stage": "answering"})
 
             results = []
-            confidences = []
+            confidences: List[float] = []
             total_latency = 0.0
             now_ts = datetime.utcnow()
-
-            # Process each question and stream immediately
-            for idx, question_obj in enumerate(questions):
+            # Answer questions, stream answers, then emit a single final summary + decision.
+            for q_idx, question_obj in enumerate(questions or []):
                 question_text = question_obj.get("question", "")
-                question_id = question_obj.get("questionId", f"q{idx + 1}")
+                question_id = question_obj.get("questionId", f"q{q_idx + 1}")
 
                 yield _sse(
                     "status",
-                    {"stage": "answering_question", "index": idx + 1, "questionId": question_id},
+                    {"stage": "answering_question", "index": q_idx + 1, "questionId": question_id},
                 )
 
                 result = process_single_transcript_question(
@@ -3669,7 +4288,6 @@ def process_transcript_stream():
                 result["questionType"] = question_obj.get("questionType", "general")
                 result["userIntent"] = question_obj.get("userIntent", "")
 
-                # Enforce API contract: relevantChunks must be a non-empty list[str]
                 rc = result.get("relevantChunks") or []
                 if isinstance(rc, list):
                     rc = [str(x) for x in rc if str(x).strip()]
@@ -3680,12 +4298,12 @@ def process_transcript_stream():
                 result["relevantChunks"] = rc[:4]
 
                 if "error" not in result:
-                    confidences.append(result.get("confidence", 0.0))
+                    confidences.append(float(result.get("confidence", 0.0) or 0.0))
                     total_latency += float(result.get("latency", 0.0) or 0.0)
 
                 results.append(result)
 
-                # Persist incremental chat to Mongo (so /history can show progress if needed)
+                # Persist incremental chat
                 try:
                     chunks = result.get("relevantChunks") or []
                     relevant_docs_text = "\n\n---\n\n".join([str(c) for c in chunks if str(c).strip()])
@@ -3712,7 +4330,6 @@ def process_transcript_stream():
                 except Exception as e:
                     print(f"Warning: failed to persist incremental transcript chat: {e}")
 
-                # Stream this answer immediately
                 yield _sse(
                     "answer",
                     {
@@ -3727,109 +4344,110 @@ def process_transcript_stream():
                     },
                 )
 
-            # Final summary (same logic as /transcripts/process)
-            final_summary_text = ""
-            try:
-                llm_summary = ChatOpenAI(temperature=0.0, model="gpt-4o")
-                qa_lines = []
-                for r in results or []:
-                    if not r:
-                        continue
-                    q = (r.get("question") or "").strip()
-                    if not q:
-                        continue
-                    a = (r.get("answer") or "").strip() or "(No answer was generated for this question.)"
-                    qa_lines.append(f"Q: {q}\nA: {a}")
-                qa_blob = "\n\n".join(qa_lines)
-                if qa_blob.strip():
-                    summary_prompt = PromptTemplate(
-                        input_variables=["qa_blob"],
-                        template=(
-                            "You are summarizing a transcript Q&A.\n"
-                            "Write a combined final answer that summarizes the answers across ALL questions.\n"
-                            "Do not omit any question's outcome; merge duplicates instead of dropping them.\n"
-                            "Focus on decisions/coverage outcomes, key exclusions/conditions, and next steps.\n"
-                            "Keep it under 10 bullet points.\n\n"
-                            "{qa_blob}\n"
-                        ),
-                    )
-                    summary_chain = summary_prompt | llm_summary | StrOutputParser()
-                    final_summary_text = summary_chain.invoke({"qa_blob": qa_blob}).strip()
-            except Exception as e:
-                print(f"Warning: failed to generate final transcript summary (stream): {e}")
-
-            if (not final_summary_text.strip()) and results:
-                final_summary_text = "\n".join(
-                    [
-                        f"- {((r.get('answer') or '').strip() or '(No answer was generated for this question.)')}"
-                        for r in results
-                        if r and (r.get("question") or "").strip()
-                    ]
-                ).strip()
-
             avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
 
-            # Claim decision grounded only in retrieved chunks (stream it before final summary UI finishes)
-            try:
-                all_chunks = []
-                for r in results or []:
-                    rc = r.get("relevantChunks") or []
-                    if isinstance(rc, list):
-                        all_chunks.extend([str(x) for x in rc if str(x).strip()])
-                seen = set()
-                deduped = []
-                for c in all_chunks:
-                    if c in seen:
-                        continue
-                    seen.add(c)
-                    deduped.append(c)
-                claim_decision = generate_claim_decision_from_chunks(deduped)
-                yield _sse("claimDecision", claim_decision)
-            except Exception as e:
-                print(f"Warning: failed to generate/stream claimDecision: {e}")
+            # Build claimDecision + finalSummary from the aggregated Q/A
+            qa_lines: List[str] = []
+            all_chunks: List[str] = []
+            for r in results:
+                q = (r.get("question") or "").strip()
+                a = (r.get("answer") or "").strip()
+                if q and a:
+                    qa_lines.append(f"Q: {q}\nA: {a}")
+                rc = r.get("relevantChunks") or []
+                if isinstance(rc, list):
+                    all_chunks.extend([str(x) for x in rc if str(x).strip()])
+            seen = set()
+            cited_chunks: List[str] = []
+            for c in all_chunks:
+                if c in seen or c in _PLACEHOLDER_CHUNK_VALUES:
+                    continue
+                seen.add(c)
+                cited_chunks.append(c)
+            qa_blob = "\n\n".join(qa_lines[:12]).strip()
 
-            # Store final answer as last chat entry and finalize conversation doc
+            claim_decision = generate_claim_decision_from_qa(
+                qa_blob,
+                llm=ChatOpenAI(temperature=0.0, model="gpt-4o-mini"),
+                cited_chunks=cited_chunks,
+            )
+            final_summary_text = generate_calls_final_summary(
+                qa_blob,
+                claim_decision=claim_decision,
+                contract_type=contract_type,
+                selected_plan=selected_plan,
+                selected_state=selected_state,
+                llm=ChatOpenAI(temperature=0.0, model="gpt-4o-mini"),
+            )
+
+            # Finalize conversation doc and store response payload (for cache + /history)
             try:
+                response_payload = {
+                    "conversationId": str(conv_doc_id),
+                    "conversationName": conv_name or "",
+                    "status": transcript_status,
+                    "transcriptId": transcript_id,
+                    "transcriptMetadata": {
+                        "fileName": file_metadata.get("fileName"),
+                        "uploadDate": file_metadata.get("uploadDate"),
+                        "fileSize": file_metadata.get("fileSize"),
+                    },
+                    "questions": results,
+                    "claimDecision": claim_decision,
+                    "finalSummary": final_summary_text,
+                    "summary": {
+                        "totalQuestions": len(results),
+                        "processedQuestions": len([r for r in results if "error" not in r]),
+                        "averageConfidence": round(avg_confidence, 2),
+                        "totalLatency": round(total_latency, 2),
+                    },
+                }
                 qna_collection.update_one(
                     {"_id": conv_doc_id},
                     {
-                        "$push": {
-                            "chats": {
-                                "chat_id": "final_answer",
-                                "entered_query": "Final Answer for transcript",
-                                "response": final_summary_text,
-                                "relevant_chunks": [],
-                                "relevant_docs": "",
-                                "gpt_model": "Calls",
-                                "underlying_model": gpt_model,
-                                "chat_timestamp": datetime.utcnow(),
-                                "latency": 0.0,
-                                "confidence": 0.0,
-                            }
-                        },
                         "$set": {
                             "processing": False,
                             "updated_at": datetime.utcnow(),
-                            "final_summary": final_summary_text,
-                            "claim_decision": claim_decision if 'claim_decision' in locals() else None,
-                            "summary": {
-                                "totalQuestions": len(questions),
-                                "processedQuestions": len([r for r in results if "error" not in r]),
-                                "averageConfidence": round(avg_confidence, 2),
-                                "totalLatency": round(total_latency, 2),
-                            },
-                            "transcript_metadata": {
-                                "fileName": file_metadata.get("fileName"),
-                                "uploadDate": file_metadata.get("uploadDate"),
-                                "fileSize": file_metadata.get("fileSize"),
-                            },
-                        },
+                            "summary": response_payload.get("summary"),
+                            "transcript_metadata": response_payload.get("transcriptMetadata"),
+                            "claimDecision": claim_decision,
+                            "finalSummary": final_summary_text,
+                            "response_payload": response_payload,
+                        }
                     },
                 )
+
+                # Persist final answer chat
+                try:
+                    cited = claim_decision.get("citedChunks") or []
+                    if not isinstance(cited, list):
+                        cited = []
+                    relevant_docs_text = "\n\n---\n\n".join([str(c) for c in cited if str(c).strip()])
+                    qna_collection.update_one(
+                        {"_id": conv_doc_id},
+                        {
+                            "$push": {
+                                "chats": {
+                                    "chat_id": "final_answer",
+                                    "entered_query": "Final Answer for transcript",
+                                    "response": final_summary_text,
+                                    "relevant_chunks": cited[:3],
+                                    "relevant_docs": relevant_docs_text,
+                                    "gpt_model": "Calls",
+                                    "underlying_model": gpt_model,
+                                    "chat_timestamp": datetime.utcnow(),
+                                    "latency": 0.0,
+                                    "confidence": float(claim_decision.get("confidence", 0.0) or 0.0),
+                                }
+                            }
+                        },
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to persist final answer chat: {e}")
             except Exception as e:
                 print(f"Warning: failed to finalize transcript conversation doc (stream): {e}")
 
-            yield _sse("final", {"finalSummary": final_summary_text})
+            yield _sse("final", {"finalSummary": final_summary_text, "claimDecision": claim_decision})
             yield _sse(
                 "done",
                 {
@@ -3892,6 +4510,10 @@ def process_transcript():
                 contract_type_norm = normalize_contract_type(contract_type)
                 selected_plan_norm = normalize_plan_for_milvus(contract_type_norm, selected_plan)
                 gpt_model = data.get("gptModel", "Search")
+                # Transcript processing supports only Search/Infer. If the client sends "Calls"
+                # (UI mode label) or anything unexpected, normalize to Infer so Calls always reasons.
+                if gpt_model not in ("Search", "Infer"):
+                    gpt_model = "Infer"
                 extract_questions = data.get("extractQuestions", True)
                 provided_questions = data.get("questions", [])
                 force_reprocess = bool(data.get("forceReprocess", False))
@@ -3951,7 +4573,7 @@ def process_transcript():
                         ):
                             has_placeholder_chunks = True
                             break
-                    if has_placeholder_chunks or not existing_conv.get("final_summary"):
+                    if has_placeholder_chunks or not existing_conv.get("finalSummary"):
                         # We'll reprocess, but keep updating the same conversation document.
                         conv_doc_id = existing_conv.get("_id")
                         conv_name = existing_conv.get("conversation_name")
@@ -3966,7 +4588,8 @@ def process_transcript():
                 cached["conversationId"] = str(existing_conv.get("_id"))
                 cached.setdefault("transcriptId", existing_conv.get("transcript_id"))
                 cached.setdefault("transcriptMetadata", existing_conv.get("transcript_metadata"))
-                cached.setdefault("finalSummary", existing_conv.get("final_summary"))
+                cached.setdefault("finalSummary", existing_conv.get("finalSummary") or "")
+                cached.setdefault("claimDecision", existing_conv.get("claimDecision") or {})
                 cached.setdefault("status", existing_conv.get("status", "active"))
                 cached.setdefault("conversationName", existing_conv.get("conversation_name"))
 
@@ -3997,14 +4620,6 @@ def process_transcript():
                         q["relevantChunks"] = rc[:4]
                 except Exception as e:
                     print(f"Warning: failed to normalize cached relevantChunks: {e}")
-
-                cached.setdefault(
-                    "finalAnswer",
-                    {
-                        "question": "Final Answer for transcript",
-                        "answer": cached.get("finalSummary") or "",
-                    },
-                )
 
                 return jsonify(cached), 200
 
@@ -4080,45 +4695,91 @@ def process_transcript():
                     except json.JSONDecodeError:
                         # If not JSON, treat as plain text
                         transcript_text = transcript_content
+                    transcript_text = _clean_calls_transcript_text(transcript_text)
                     
                 except FileNotFoundError as e:
                     return jsonify({"error": f"Transcript file not found: {transcript_file_name}"}), 404
                 except Exception as e:
                     return jsonify({"error": f"Error reading transcript file: {str(e)}"}), 500
             
-            # Extract questions
-            questions = []
-            if extract_questions:
-                with tracer.start_span('extract-questions', child_of=parent0):
-                    llm_extract = ChatOpenAI(temperature=0.0, model="gpt-4o")
-                    # Try direct extraction first (more reliable), then agent if needed
-                    print(f"DEBUG: Attempting direct extraction first...")
-                    questions = extract_relevant_customer_questions(transcript_text, llm_extract)
-                    
-                    # If direct extraction fails, try agent-based extraction
-                    if not questions or len(questions) == 0:
-                        print(f"DEBUG: Direct extraction returned no questions, trying agent-based extraction...")
-                        questions = extract_questions_with_agent(transcript_text, llm_extract)
-                    
-                    if not questions:
-                        print(f"ERROR: No questions extracted from transcript '{transcript_file_name}'")
-                        print(f"ERROR: Transcript length: {len(transcript_text)} characters")
-                        print(f"ERROR: First 500 chars of transcript: {transcript_text[:500]}")
-                        extraction_warning = (
-                            "No questions could be extracted from transcript; inferring from context."
-                        )
-                        inferred_question = {
-                            "question": f"Is this issue covered: {transcript_text[:120]}",
-                            "context": transcript_text[:400],
-                            "questionType": "coverage",
-                            "userIntent": "Customer wants to know if the described issue is covered",
-                            "questionId": "q1",
-                        }
-                        questions = [inferred_question]
-            else:
-                questions = provided_questions
-                if not questions:
+            # Classic Calls flow (no adjudication dashboard): extract questions -> answer -> claimDecision + finalSummary.
+            if not (transcript_text or "").strip():
+                extraction_warning = "Transcript is empty after cleaning."
+                payload = _calls_no_questions_extracted_response(contract_type, selected_plan, selected_state)
+                response = {
+                    "transcriptId": transcript_id,
+                    "transcriptMetadata": {
+                        "fileName": file_metadata["fileName"],
+                        "uploadDate": file_metadata["uploadDate"],
+                        "fileSize": file_metadata["fileSize"],
+                    },
+                    "questions": [],
+                    "claimDecision": payload.get("claimDecision") or {},
+                    "finalSummary": payload.get("finalSummary", ""),
+                    "summary": {
+                        "totalQuestions": 0,
+                        "processedQuestions": 0,
+                        "averageConfidence": 0.0,
+                        "totalLatency": 0.0,
+                    },
+                    "warning": extraction_warning,
+                }
+                return jsonify(response), 200
+
+            if _is_low_signal_calls_transcript(transcript_text):
+                extraction_warning = "Transcript is low-signal for coverage adjudication."
+                payload = _calls_low_signal_response(contract_type, selected_plan, selected_state)
+                response = {
+                    "transcriptId": transcript_id,
+                    "transcriptMetadata": {
+                        "fileName": file_metadata["fileName"],
+                        "uploadDate": file_metadata["uploadDate"],
+                        "fileSize": file_metadata["fileSize"],
+                    },
+                    "questions": [],
+                    "claimDecision": payload.get("claimDecision") or {},
+                    "finalSummary": payload.get("finalSummary", ""),
+                    "summary": {
+                        "totalQuestions": 0,
+                        "processedQuestions": 0,
+                        "averageConfidence": 0.0,
+                        "totalLatency": 0.0,
+                    },
+                    "warning": extraction_warning,
+                }
+                return jsonify(response), 200
+
+            # Extract questions (agent-based) or use provided questions (back-compat)
+            if not extract_questions:
+                if not provided_questions:
                     return jsonify({"error": "No questions provided"}), 400
+                questions = provided_questions
+            else:
+                llm_extract = ChatOpenAI(temperature=0.0, model="gpt-4o")
+                questions = extract_questions_with_agent(transcript_text, llm_extract) or []
+
+            if not questions:
+                extraction_warning = "No questions extracted from transcript."
+                payload = _calls_no_questions_extracted_response(contract_type, selected_plan, selected_state)
+                response = {
+                    "transcriptId": transcript_id,
+                    "transcriptMetadata": {
+                        "fileName": file_metadata["fileName"],
+                        "uploadDate": file_metadata["uploadDate"],
+                        "fileSize": file_metadata["fileSize"],
+                    },
+                    "questions": [],
+                    "claimDecision": payload.get("claimDecision") or {},
+                    "finalSummary": payload.get("finalSummary", ""),
+                    "summary": {
+                        "totalQuestions": 0,
+                        "processedQuestions": 0,
+                        "averageConfidence": 0.0,
+                        "totalLatency": 0.0,
+                    },
+                    "warning": extraction_warning,
+                }
+                return jsonify(response), 200
             
             # Initialize vector DB and LLM
             with tracer.start_span('vector_db-initialization', child_of=parent0):
@@ -4164,27 +4825,34 @@ def process_transcript():
                 else:
                     return jsonify({"error": f"Invalid gpt_model: {gpt_model}. Must be 'Search' or 'Infer'"}), 400
             
-            # Process each question
-            results = []
-            total_latency = 0
-            confidences = []
-            
+            # Answer each extracted question (no adjudication dashboard)
+            results: List[Dict] = []
+            total_latency = 0.0
+            confidences: List[float] = []
+
             with tracer.start_span('process-questions', child_of=parent0):
-                for question_obj in questions:
+                for q_idx, question_obj in enumerate(questions or []):
                     question_text = question_obj.get("question", "")
-                    question_id = question_obj.get("questionId", f"q{len(results) + 1}")
-                    
+                    question_id = question_obj.get("questionId", f"q{q_idx + 1}")
+
                     result = process_single_transcript_question(
-                        question_text, contract_type, selected_plan, 
-                        selected_state, gpt_model, vector_db1, llm, llm2, 
-                        retriever, handler
+                        question_text,
+                        contract_type,
+                        selected_plan,
+                        selected_state,
+                        gpt_model,
+                        vector_db1,
+                        llm,
+                        llm2,
+                        retriever,
+                        handler,
                     )
-                    
+
                     result["questionId"] = question_id
                     result["question"] = question_text
                     result["context"] = question_obj.get("context", "")
                     result["questionType"] = question_obj.get("questionType", "general")
-                    result["userIntent"] = question_obj.get("userIntent", "")  # Include user intent if available
+                    result["userIntent"] = question_obj.get("userIntent", "")
 
                     # Enforce API contract: relevantChunks must be a non-empty list[str]
                     rc = result.get("relevantChunks") or []
@@ -4196,133 +4864,64 @@ def process_transcript():
                         rc = ["(No relevant chunks returned from Milvus)"]
                     result["relevantChunks"] = rc[:4]
 
-                    rc = result.get("relevantChunks", [])
-                    print(
-                        "[CHUNKS] /transcripts/process: per-question result "
-                        f"questionId={question_id}, relevantChunks_count={len(rc)}"
-                    )
-                    # Log the actual relevantChunks we are about to include in the response
-                    try:
-                        def _chunk_preview(c):
-                            # relevantChunks is list[str] (new contract) but support legacy dict chunks too
-                            if isinstance(c, dict):
-                                return {
-                                    "content_preview": (c.get("content", "") or "")[:200].replace(chr(10), " "),
-                                    "score": c.get("score"),
-                                }
-                            return {
-                                "content_preview": (str(c) or "")[:200].replace(chr(10), " "),
-                                "score": None,
-                            }
-
-                        print(
-                            "[CHUNKS] /transcripts/process: per-question relevantChunks_detail="
-                            f"{[_chunk_preview(c) for c in rc]}"
-                        )
-                    except Exception as e:
-                        print(f"[CHUNKS] /transcripts/process: unable to log chunk detail: {e}")
-                    
                     if "error" not in result:
-                        confidences.append(result.get("confidence", 0.0))
-                        total_latency += result.get("latency", 0.0)
-                    
+                        confidences.append(float(result.get("confidence", 0.0) or 0.0))
+                        total_latency += float(result.get("latency", 0.0) or 0.0)
+
                     results.append(result)
-            
-            # Calculate summary
+
             avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-            
+            qa_lines: List[str] = []
+            all_chunks: List[str] = []
+            for r in results:
+                q = (r.get("question") or "").strip()
+                a = (r.get("answer") or "").strip()
+                if q and a:
+                    qa_lines.append(f"Q: {q}\nA: {a}")
+                rc = r.get("relevantChunks") or []
+                if isinstance(rc, list):
+                    all_chunks.extend([str(x) for x in rc if str(x).strip()])
+            seen = set()
+            cited_chunks: List[str] = []
+            for c in all_chunks:
+                if c in seen or c in _PLACEHOLDER_CHUNK_VALUES:
+                    continue
+                seen.add(c)
+                cited_chunks.append(c)
+            qa_blob = "\n\n".join(qa_lines[:12]).strip()
+
+            claim_decision = generate_claim_decision_from_qa(
+                qa_blob,
+                llm=ChatOpenAI(temperature=0.0, model="gpt-4o-mini"),
+                cited_chunks=cited_chunks,
+            )
+            final_summary_text = generate_calls_final_summary(
+                qa_blob,
+                claim_decision=claim_decision,
+                contract_type=contract_type,
+                selected_plan=selected_plan,
+                selected_state=selected_state,
+                llm=ChatOpenAI(temperature=0.0, model="gpt-4o-mini"),
+            )
             response = {
                 "transcriptId": transcript_id,
                 "transcriptMetadata": {
                     "fileName": file_metadata["fileName"],
                     "uploadDate": file_metadata["uploadDate"],
-                    "fileSize": file_metadata["fileSize"]
+                    "fileSize": file_metadata["fileSize"],
                 },
                 "questions": results,
+                "claimDecision": claim_decision,
+                "finalSummary": final_summary_text,
                 "summary": {
-                    "totalQuestions": len(questions),
+                    "totalQuestions": len(results),
                     "processedQuestions": len([r for r in results if "error" not in r]),
                     "averageConfidence": round(avg_confidence, 2),
-                    "totalLatency": round(total_latency, 2)
-                }
+                    "totalLatency": round(total_latency, 2),
+                },
             }
             if extraction_warning:
                 response["warning"] = extraction_warning
-
-            # Claim decision (Approved/Rejected/Cannot determine), grounded only in retrieved policy chunks
-            try:
-                all_chunks = []
-                for r in results or []:
-                    rc = r.get("relevantChunks") or []
-                    if isinstance(rc, list):
-                        all_chunks.extend([str(x) for x in rc if str(x).strip()])
-                # de-duplicate while preserving order
-                seen = set()
-                deduped = []
-                for c in all_chunks:
-                    if c in seen:
-                        continue
-                    seen.add(c)
-                    deduped.append(c)
-                claim_decision = generate_claim_decision_from_chunks(deduped)
-                response["claimDecision"] = claim_decision
-            except Exception as e:
-                print(f"Warning: unable to generate claimDecision: {e}")
-
-            # Build a final answer: combined summary of answers across ALL extracted questions.
-            # We intentionally include every Q/A we produced (even if confidence is low),
-            # and only skip items that have no question text at all.
-            final_summary_text = ""
-            try:
-                with tracer.start_span('final-summary', child_of=parent0):
-                    llm_summary = ChatOpenAI(temperature=0.0, model="gpt-4o")
-                    qa_lines = []
-                    for r in results or []:
-                        if not r:
-                            continue
-                        q = (r.get("question") or "").strip()
-                        if not q:
-                            continue
-                        a = (r.get("answer") or "").strip()
-                        # If answer is missing but question exists, keep a placeholder so the final summary
-                        # still reflects ALL extracted questions.
-                        if not a:
-                            a = "(No answer was generated for this question.)"
-                        qa_lines.append(f"Q: {q}\nA: {a}")
-
-                    qa_blob = "\n\n".join(qa_lines)
-                    if qa_blob.strip():
-                        summary_prompt = PromptTemplate(
-                            input_variables=["qa_blob"],
-                            template=(
-                                "You are summarizing a transcript Q&A.\n"
-                                "Write a combined final answer that summarizes the answers across ALL questions.\n"
-                                "Do not omit any question's outcome; merge duplicates instead of dropping them.\n"
-                                "Focus on decisions/coverage outcomes, key exclusions/conditions, and next steps.\n"
-                                "Keep it under 10 bullet points.\n\n"
-                                "{qa_blob}\n"
-                            ),
-                        )
-                        summary_chain = summary_prompt | llm_summary | StrOutputParser()
-                        final_summary_text = summary_chain.invoke({"qa_blob": qa_blob}).strip()
-            except Exception as e:
-                print(f"Warning: failed to generate final transcript summary: {e}")
-
-            # Ensure Final Answer is always present when we have questions (even if summarization failed).
-            if (not final_summary_text.strip()) and (results and len(results) > 0):
-                final_summary_text = "\n".join(
-                    [
-                        f"- {((r.get('answer') or '').strip() or '(No answer was generated for this question.)')}"
-                        for r in results
-                        if r and (r.get("question") or "").strip()
-                    ]
-                ).strip()
-
-            response["finalSummary"] = final_summary_text
-            response["finalAnswer"] = {
-                "question": "Final Answer for transcript",
-                "answer": final_summary_text,
-            }
 
             total_chunks = sum(len(r.get("relevantChunks", [])) for r in results)
             print(
@@ -4355,29 +4954,25 @@ def process_transcript():
                     "confidence": res.get("confidence", 0.0),
                 })
 
-            # Store final answer as a final chat entry in MongoDB, using a fixed question label
-            transcript_chats.append({
-                "chat_id": "final_answer",
-                "entered_query": "Final Answer for transcript",
-                "response": final_summary_text,
-                "relevant_chunks": [],
-                "relevant_docs": "",
-                "gpt_model": "Calls",
-                "underlying_model": gpt_model,
-                "chat_timestamp": now_ts,
-                "latency": 0.0,
-                "confidence": 0.0,
-            })
-
-            # Also include it in the response questions list so the UI can render it as the last Q/A.
-            response["questions"] = (response.get("questions") or []) + [{
-                "questionId": "final_answer",
-                "question": "Final Answer for transcript",
-                "answer": final_summary_text,
-                "relevantChunks": [],
-                "confidence": 0.0,
-                "latency": 0.0,
-            }]
+            # Append final answer chat so UI can render a summary at the end.
+            cited = claim_decision.get("citedChunks") or []
+            if not isinstance(cited, list):
+                cited = []
+            cited = [str(x).strip() for x in cited if str(x).strip()][:3]
+            transcript_chats.append(
+                {
+                    "chat_id": "final_answer",
+                    "entered_query": "Final Answer for transcript",
+                    "response": final_summary_text,
+                    "relevant_chunks": cited,
+                    "relevant_docs": "\n\n---\n\n".join([str(c) for c in cited if str(c).strip()]),
+                    "gpt_model": "Calls",
+                    "underlying_model": gpt_model,
+                    "chat_timestamp": now_ts,
+                    "latency": 0.0,
+                    "confidence": float(claim_decision.get("confidence", 0.0) or 0.0),
+                }
+            )
 
             transcript_doc = {
                 "doc_type": "transcript_conversation",
@@ -4394,8 +4989,8 @@ def process_transcript():
                 "status": transcript_status,
                 "processing": False,
                 "summary": response.get("summary"),
-                "final_summary": final_summary_text,
-                "claim_decision": response.get("claimDecision"),
+                "claimDecision": claim_decision,
+                "finalSummary": final_summary_text,
                 "chats": transcript_chats,
             }
 

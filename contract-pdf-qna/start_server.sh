@@ -11,7 +11,17 @@ if [ -f "venv/bin/activate" ]; then
 fi
 
 # Choose python from the (possibly activated) environment.
-PYTHON_BIN="${PYTHON_BIN:-python}"
+# On many macOS setups, `python` is not available but `python3` is.
+if [ -n "${PYTHON_BIN:-}" ]; then
+  : # honor PYTHON_BIN if explicitly set
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+else
+  echo "ERROR: Neither 'python' nor 'python3' found on PATH. Please install Python 3 and retry."
+  exit 1
+fi
 
 # Set SSL certificate environment variables
 # CRITICAL: These must be set BEFORE Python imports fsspec/gcsfs
@@ -33,7 +43,8 @@ echo ""
 
 # Kill any existing server processes
 echo "Stopping any existing server processes..."
-pkill -f "python.*app.py" 2>/dev/null
+# Try to stop any previous instance of this backend (covers python/python3/Python.app).
+pkill -f "[Pp]ython.*app\\.py" 2>/dev/null || true
 sleep 2
 
 # Start the server

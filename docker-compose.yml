@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./contract-pdf-qna
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      # Required runtime configuration (set these in your shell or .env file used by docker compose)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MONGO_URI=${MONGO_URI}
+      - MILVUS_HOST=${MILVUS_HOST}
+      - GCP_BUCKET_NAME=${GCP_BUCKET_NAME:-ahs-demo-transcripts}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-generative-ai-390411}
+      # Optional: point to service account json inside container
+      - GCP_SERVICE_ACCOUNT_PATH=/run/secrets/gcp_sa.json
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp_sa.json
+    secrets:
+      - gcp_sa
+
+  frontend:
+    build:
+      context: ./contract-pdf-qna-frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8001}
+        VITE_TRANSCRIPTS_API_BASE_URL: ${VITE_TRANSCRIPTS_API_BASE_URL:-http://localhost:8001}
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+secrets:
+  gcp_sa:
+    file: ./contract-pdf-qna/gcp-service-account.json
+
+

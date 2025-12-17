@@ -243,10 +243,17 @@
           background: #fff6f6;
         }
 
+        .calls_decision_send_for_human_review {
+          border-color: #f3d3a2;
+          background: #fffaf0;
+        }
+
         .calls_decision_cannot_determine {
           border-color: #d7d7d7;
           background: #fafafa;
         }
+
+        // Calls dashboard (per-dispatch adjudication) removed; classic Calls uses a single decision card + final answer.
       }
       .inpufield_wrapper {
         width: 926px;

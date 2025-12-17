@@ -205,8 +205,9 @@ const Home = ({ bearerToken, setBearerToken }) => {
       contractType,
       selectedPlan: planName,
       selectedState: stateName,
-      // Use underlying QA behaviour; UI will still label this as "Calls"
-      gptModel: gptModel === "Infer" ? "Infer" : "Search",
+      // Calls mode always runs the reasoning/agent path for transcript questions.
+      // We still label the UI/history as "Calls" separately.
+      gptModel: "Infer",
       extractQuestions: true,
       newConversation: Boolean(opts?.newConversation),
       conversationName: transcript.name || transcript.id,
@@ -232,10 +233,11 @@ const Home = ({ bearerToken, setBearerToken }) => {
         .then((response) => {
           const conversationIdFromApi = response?.data?.conversationId || "";
           const questions = response?.data?.questions || [];
-          const apiFinalSummary = response?.data?.finalSummary || "";
           const extractionWarning = response?.data?.warning;
-          setFinalSummary(apiFinalSummary);
-          setCallsClaimDecision(response?.data?.claimDecision || null);
+          const fs = response?.data?.finalSummary || "";
+          const cd = response?.data?.claimDecision || null;
+          setFinalSummary(fs);
+          setCallsClaimDecision(cd);
           setConversationStatus((response?.data?.status || "active").toLowerCase());
           setCallsGenerationStage("done");
           setCallsProgressText("");
@@ -250,7 +252,6 @@ const Home = ({ bearerToken, setBearerToken }) => {
             questions.length > 0
               ? questions.map((q) => {
                   const chunks = q.relevantChunks || [];
-                  const isFinal = q.questionId === "final_answer";
                   return {
                     entered_query: q.question,
                     response: q.answer,
@@ -260,7 +261,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
                     userIntent: q.userIntent,
                     relevant_chunks: chunks,
                     underlying_model: requestBody.gptModel,
-                    source: isFinal ? "final_answer" : "transcript_extracted",
+                    source: "transcript_extracted",
                   };
                 })
               : [
@@ -273,7 +274,24 @@ const Home = ({ bearerToken, setBearerToken }) => {
                   },
                 ];
 
-          setChats(mappedChats);
+          const hasFinal = mappedChats?.some(
+            (c) => c?.questionId === "final_answer" || c?.chat_id === "final_answer"
+          );
+          const finalChat =
+            fs && !hasFinal
+              ? [
+                  {
+                    entered_query: "Final Answer for transcript",
+                    response: fs,
+                    chat_id: "final_answer",
+                    questionId: "final_answer",
+                    relevant_chunks: cd?.citedChunks || [],
+                    source: "final_answer",
+                  },
+                ]
+              : [];
+
+          setChats([...(mappedChats || []), ...finalChat]);
           setIsCallsMode(true);
           setGptModelState("Calls");
           setSidebarRefreshTick((t) => t + 1);
@@ -436,18 +454,38 @@ const Home = ({ bearerToken, setBearerToken }) => {
                   if (next < total) {
                     setCallsProgressText(`Received answer ${next} of ${total}. Generating next…`);
                   } else {
-                    setCallsProgressText("Generating final summary…");
+                  setCallsProgressText("Generating final summary…");
                   }
                 } else {
-                  setCallsProgressText("Generating final summary…");
+                setCallsProgressText("Generating final summary…");
                 }
                 return next;
               });
             } else if (eventType === "final") {
-              setFinalSummary(payload?.finalSummary || "");
+              const fs = payload?.finalSummary || "";
+              const cd = payload?.claimDecision || null;
+              setFinalSummary(fs);
+              setCallsClaimDecision(cd);
+              if (fs) {
+                setChats((prev) => {
+                  const already = (prev || []).some(
+                    (c) => c?.questionId === "final_answer" || c?.chat_id === "final_answer"
+                  );
+                  if (already) return prev || [];
+                  return [
+                    ...(prev || []),
+                    {
+                      entered_query: "Final Answer for transcript",
+                      response: fs,
+                      chat_id: "final_answer",
+                      questionId: "final_answer",
+                      relevant_chunks: cd?.citedChunks || [],
+                      source: "final_answer",
+                    },
+                  ];
+                });
+              }
               setCallsProgressText("Final summary ready. Finishing…");
-            } else if (eventType === "claimDecision") {
-              setCallsClaimDecision(payload || null);
             } else if (eventType === "done") {
               setCallsGenerationStage("done");
               setCallsProgressText("");
@@ -519,7 +557,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
           setSelectedState(response.data.selectedState);
           setSelectedContract(response.data.contractType);
           setSelectedPlan(response.data.selectedPlan);
-          setFinalSummary(response.data.finalSummary || "");
+          setFinalSummary(response?.data?.finalSummary || "");
           setCallsClaimDecision(response?.data?.claimDecision || null);
           setConversationStatus((response.data.status || "active").toLowerCase());
 
@@ -928,24 +966,32 @@ const Home = ({ bearerToken, setBearerToken }) => {
                       ) : null}
                     </div>
                   ) : null}
-                  {isCallsMode && callsClaimDecision ? (
-                    <div className={`calls_decision calls_decision_${(callsClaimDecision.decision || '').toLowerCase()}`}>
+                  {isCallsMode && callsClaimDecision?.decision ? (
+                    <div
+                      className={`calls_decision calls_decision_${String(
+                        callsClaimDecision?.decision || ""
+                      )
+                        .toLowerCase()
+                        .replace(/[^a-z0-9]+/g, "_")}`}
+                    >
                       <div className="headline">
-                        Decision: <span className="value">{callsClaimDecision.decision}</span>
+                        Decision:{" "}
+                        <span className="value">{callsClaimDecision?.decision}</span>
                       </div>
-                      {callsClaimDecision.shortAnswer ? (
+                      {callsClaimDecision?.shortAnswer ? (
                         <div className="short">{callsClaimDecision.shortAnswer}</div>
                       ) : null}
-                      {Array.isArray(callsClaimDecision.reasons) && callsClaimDecision.reasons.length > 0 ? (
+                      {Array.isArray(callsClaimDecision?.reasons) &&
+                      callsClaimDecision.reasons.length > 0 ? (
                         <ul className="reasons">
-                          {callsClaimDecision.reasons.slice(0, 4).map((r, idx) => (
+                          {callsClaimDecision.reasons.map((r, idx) => (
                             <li key={idx}>{r}</li>
                           ))}
                         </ul>
                       ) : null}
-                      {Array.isArray(callsClaimDecision.citedChunks) && callsClaimDecision.citedChunks.length > 0 ? (
+                      {callsClaimDecision?.authorizedAmount ? (
                         <div className="cite">
-                          Based on {callsClaimDecision.citedChunks.length} policy chunk(s).
+                          Authorized Amount: {callsClaimDecision.authorizedAmount}
                         </div>
                       ) : null}
                     </div>
@@ -964,12 +1010,6 @@ const Home = ({ bearerToken, setBearerToken }) => {
                     conversationId={conversationId}
                     isCallsMode={isCallsMode}
                   />
-                  {isCallsMode && finalSummary && !hasFinalAnswerChat ? (
-                    <div className="calls_summary">
-                      <div className="title">Final Summary</div>
-                      <div className="text">{finalSummary}</div>
-                    </div>
-                  ) : null}
                 </>
               </div>
             ) : null}
