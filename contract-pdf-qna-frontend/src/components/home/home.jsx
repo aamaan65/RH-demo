@@ -18,8 +18,10 @@ import ChatList from "../chatList/chatList";
 import CallsTranscriptModal from "../callsTranscriptModal/callsTranscriptModal";
 import CaseReviewApprovePopup from "../caseReviewApprovePopup/caseReviewApprovePopup";
 import { formatTranscriptDisplayName } from "../utils/transcriptName";
+import { ItemizedFinalAnswer } from "../common/itemizedFinalAnswer/itemizedFinalAnswer";
+import { ItemizedDecision } from "../common/itemizedDecision/itemizedDecision";
 
-const TRANSCRIPTS_PAGE_SIZE = 9;
+const TRANSCRIPTS_PAGE_SIZE = 16;
 
 const Home = ({ bearerToken, setBearerToken }) => {
   const location = useLocation();
@@ -65,12 +67,14 @@ const Home = ({ bearerToken, setBearerToken }) => {
   const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
   const [isCheckingExistingTranscriptConversation, setIsCheckingExistingTranscriptConversation] =
     useState(false);
+  const [isLoadingConversation, setIsLoadingConversation] = useState(false);
   const [existingTranscriptConversations, setExistingTranscriptConversations] = useState([]);
   const [loggedInUserName, setLoggedInUserName] = useState("");
   const [isReviewApproveOpen, setIsReviewApproveOpen] = useState(false);
   const [isApprovingCase, setIsApprovingCase] = useState(false);
   const [justApproved, setJustApproved] = useState(false);
   const [recentlyClosedConversationId, setRecentlyClosedConversationId] = useState("");
+  const transcriptSearchDebounceRef = useRef(null);
 
   useEffect(() => {
     // Pull display name from the Google login payload stored by SideBar.
@@ -197,7 +201,16 @@ const Home = ({ bearerToken, setBearerToken }) => {
     setTranscriptSearch(value);
     setTranscriptsOffset(0);
     setTranscriptsHasMore(true);
-    fetchTranscripts(value, transcriptStatusFilter, 0, false);
+    
+    // Clear existing debounce timeout
+    if (transcriptSearchDebounceRef.current) {
+      clearTimeout(transcriptSearchDebounceRef.current);
+    }
+    
+    // Set new debounce timeout (300ms delay)
+    transcriptSearchDebounceRef.current = setTimeout(() => {
+      fetchTranscripts(value, transcriptStatusFilter, 0, false);
+    }, 300);
   };
 
   const handleTranscriptStatusChange = (status) => {
@@ -441,7 +454,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
               }
               if (stage === "transcript_loading") {
                 setCallsActiveStep("extract");
-                setCallsProgressText("Loading transcript from GCS…");
+                setCallsProgressText("Loading transcript…");
               }
               if (stage === "transcript_loaded") {
                 const fn = payload?.transcriptMetadata?.fileName;
@@ -468,7 +481,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
               }
               if (stage === "initializing_retriever") {
                 setCallsActiveStep("answer");
-                setCallsProgressText("Loading knowledge base (Milvus)…");
+                setCallsProgressText("Loading…");
               }
               if (stage === "answering") {
                 setCallsActiveStep("answer");
@@ -567,6 +580,9 @@ const Home = ({ bearerToken, setBearerToken }) => {
 
   useEffect(() => {
     if (conversationId !== "") {
+      setIsLoadingConversation(true);
+      // Avoid showing stale content while switching conversations from history.
+      setChats([]);
       const apiUrl = `${API_BASE_URL}/history?conversation-id=${conversationId}`;
       axios
         .get(apiUrl)
@@ -613,6 +629,9 @@ const Home = ({ bearerToken, setBearerToken }) => {
         })
         .catch((error) => {
           console.error("Error:", error);
+        })
+        .finally(() => {
+          setIsLoadingConversation(false);
         });
     } else {
       setChats([]);
@@ -629,6 +648,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
       setCallsGenerationStage("idle");
       setCallsClaimDecision(null);
       setCallsGeneratedAt(null);
+      setIsLoadingConversation(false);
     }
   }, [conversationId]);
 
@@ -685,6 +705,15 @@ const Home = ({ bearerToken, setBearerToken }) => {
       setIsScrollable(isContentOverflowing);
     }
   }, [chats]);
+
+  // Cleanup debounce timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (transcriptSearchDebounceRef.current) {
+        clearTimeout(transcriptSearchDebounceRef.current);
+      }
+    };
+  }, []);
 
   const handleInputSubmit = () => {
     if (!sessionStorage.getItem("idToken")) {
@@ -998,45 +1027,47 @@ const Home = ({ bearerToken, setBearerToken }) => {
               conversationId === "" &&
               chats.length === 0 &&
               !callsTranscriptName ? (
-              <div className="calls_intro">
-                <div className="calls_intro_card">
-                  <div className="calls_intro_badge">Claims</div>
-                  <div className="calls_intro_title">
-                    Upload a transcript to generate coverage-focused answers
+              <div className="prompt_wrapper calls_prompt_wrapper">
+                <div className="title">What would you like to focus on today?</div>
+                <div className="subtitle">Your AI-powered copilot is ready to assist you!</div>
+                <div className="queries_part">
+                  <div className="query">
+                    Upload a transcript to extract items, generate coverage guidance, and prepare an itemized authorization draft.
                   </div>
-                  <div className="calls_intro_subtitle">
-                    Select a claim transcript to automatically extract key coverage / repair questions,
-                    generate answers, and attach the supporting evidence used for each response.
                   </div>
-
-                  <div className="calls_intro_steps">
-                    <div className="calls_intro_step">
-                      <div className="label">1. Add transcript</div>
-                      <div className="text">
+                <div className="card_list">
+                  <div className="card_container calls_landing_card">
+                    <div className="topic">1. Load Transcript</div>
+                    <div className="prompt_info">
                         Choose a transcript from the searchable, paginated list.
                       </div>
                     </div>
-                    <div className="calls_intro_step">
-                      <div className="label">2. Process & extract</div>
-                      <div className="text">
-                        Relevant customer questions are extracted into clear, reviewable prompts.
+                  <div className="card_container calls_landing_card">
+                    <div className="topic">2. Claim Coverage Information</div>
+                    <div className="prompt_info">
+                      Summarize coverage outcomes per item and attach referred contract clauses for quick validation.
                       </div>
                     </div>
-                    <div className="calls_intro_step">
-                      <div className="label">3. Answers + referenced chunks</div>
-                      <div className="text">
-                        Answers are generated with the most relevant policy chunks so validation is fast.
-                      </div>
+                  <div className="card_container calls_landing_card">
+                    <div className="topic">3. Authorization Information</div>
+                    <div className="prompt_info">
+                      Review the itemized final draft + decision, add comments, then proceed &amp; close the case.
                     </div>
                   </div>
                 </div>
               </div>
-            ) : chats.length > 0 || (isCallsMode && callsTranscriptName) ? (
+            ) : chats.length > 0 || isLoadingConversation || (isCallsMode && callsTranscriptName) ? (
               <div
                 className={`chat_container  ${isScrollable ? "setHeight" : ""}`}
                 ref={chatRef}
               >
                 <>
+                  {isLoadingConversation ? (
+                    <div className="conversation_loading" aria-live="polite">
+                      <span className="mini_spinner" aria-hidden="true" />
+                      <div className="text">Loading conversation…</div>
+                    </div>
+                  ) : null}
                   {isCallsMode && callsTranscriptName ? (
                     <div className="calls_transcript_header">
                       <div className="header_row">
@@ -1128,60 +1159,6 @@ const Home = ({ bearerToken, setBearerToken }) => {
                       ) : null}
                     </div>
                   ) : null}
-                  {isCallsMode && callsClaimDecision ? (
-                    <div
-                      className={`calls_decision ${(() => {
-                        const raw = String(callsClaimDecision?.decision || "");
-                        const slug = raw
-                          .toLowerCase()
-                          .replace(/[^a-z0-9]+/g, "_")
-                          .replace(/^_+|_+$/g, "");
-
-                        const positive = ["approve", "approved", "accept", "accepted", "yes", "covered"];
-                        const negative = ["deny", "denied", "reject", "rejected", "no", "not_covered"];
-                        const review = [
-                          "cannot_determine",
-                          "cant_determine",
-                          "unknown",
-                          "indeterminate",
-                          "needs_review",
-                          "review",
-                          "partial",
-                          "maybe",
-                        ];
-
-                        const tone = positive.includes(slug)
-                          ? "positive"
-                          : negative.includes(slug)
-                            ? "negative"
-                            : review.includes(slug)
-                              ? "review"
-                              : "neutral";
-
-                        return `calls_decision_${slug || "unknown"} calls_decision_tone_${tone}`;
-                      })()}`}
-                    >
-                      <div className="headline">
-                        <span className="label">Decision:</span>{" "}
-                        <span className="value">{callsClaimDecision.decision || "—"}</span>
-                      </div>
-                      {callsClaimDecision.shortAnswer ? (
-                        <div className="short">{callsClaimDecision.shortAnswer}</div>
-                      ) : null}
-                      {Array.isArray(callsClaimDecision.reasons) && callsClaimDecision.reasons.length > 0 ? (
-                        <ul className="reasons">
-                          {callsClaimDecision.reasons.slice(0, 4).map((r, idx) => (
-                            <li key={idx}>{r}</li>
-                          ))}
-                        </ul>
-                      ) : null}
-                      {Array.isArray(callsClaimDecision.citedChunks) && callsClaimDecision.citedChunks.length > 0 ? (
-                        <div className="cite">
-                          Based on {callsClaimDecision.citedChunks.length} policy chunk(s).
-                        </div>
-                      ) : null}
-                    </div>
-                  ) : null}
                   <ChatList
                     chats={chats}
                     setChats={setChats}
@@ -1197,7 +1174,7 @@ const Home = ({ bearerToken, setBearerToken }) => {
                   {isCallsMode && finalSummary && !hasFinalAnswerChat ? (
                     <div className="calls_summary">
                       <div className="title">Final Summary</div>
-                      <div className="text">{finalSummary}</div>
+                      <ItemizedFinalAnswer text={finalSummary} title="" asCard={false} />
                     </div>
                   ) : null}
                 </>
@@ -1210,14 +1187,28 @@ const Home = ({ bearerToken, setBearerToken }) => {
             }`}
           >
             {isCallsMode && conversationId === "" ? (
-              <button
-                type="button"
-                className="add_transcript_button"
-                onClick={handleOpenTranscriptModal}
-                disabled={callsGenerationStage === "generating"}
-              >
-                Add Transcript
-              </button>
+              callsGenerationStage === "generating" ? (
+                <InputField
+                  listening={false}
+                  transcript={""}
+                  handleInputEnter={() => {}}
+                  handleEnter={() => {}}
+                  description={""}
+                  setDescription={() => {}}
+                  textareaRef={textareaRef}
+                  onMicrophoneClick={() => {}}
+                  disabled={true}
+                  placeholder={""}
+                />
+              ) : (
+                <button
+                  type="button"
+                  className="add_transcript_button"
+                  onClick={handleOpenTranscriptModal}
+                >
+                  Add Transcript
+                </button>
+              )
             ) : isCallsMode && conversationId && conversationStatus === "inactive" ? (
               <div className="chat_disabled_banner" role="status" aria-live="polite">
                 Chat disabled — this case is closed.

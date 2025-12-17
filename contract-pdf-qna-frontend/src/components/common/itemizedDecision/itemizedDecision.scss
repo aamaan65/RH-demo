@@ -1,0 +1,138 @@
+.itemized_decision {
+  .headline {
+    font-size: 13px;
+    font-weight: 900;
+    color: #333333;
+    margin-bottom: 6px;
+    .label {
+      font-weight: 900;
+    }
+    .value {
+      margin-left: 6px;
+      font-weight: 900;
+    }
+  }
+
+  .short {
+    font-size: 13px;
+    font-weight: 600;
+    color: #333333;
+    line-height: 18px;
+    margin-bottom: 8px;
+  }
+
+  .reasons {
+    margin: 0;
+    padding-left: 18px;
+    color: #333333;
+    font-size: 12px;
+    line-height: 18px;
+    font-weight: 600;
+  }
+
+  .by_item {
+    margin-top: 10px;
+
+    .title {
+      font-size: 12px;
+      font-weight: 900;
+      color: #2f3a57;
+      margin-bottom: 8px;
+    }
+
+    .items {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .item {
+      border: 1px solid rgba(0, 0, 0, 0.06);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.7);
+      padding: 10px 12px;
+    }
+
+    .item_head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .item_title {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: baseline;
+
+      .num {
+        font-size: 11px;
+        font-weight: 900;
+        color: #2f3a57;
+      }
+      .name {
+        font-size: 13px;
+        font-weight: 900;
+        color: #333333;
+      }
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 75px 1fr;
+      gap: 10px;
+      margin-top: 6px;
+    }
+
+    .k {
+      font-size: 11px;
+      font-weight: 900;
+      color: #2f3a57;
+    }
+    .v {
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 16px;
+      color: #333333;
+      white-space: pre-wrap;
+    }
+  }
+}
+
+.id_badge {
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 900;
+  border: 1px solid #e6e6e6;
+  background: #fbfbfb;
+  color: #2f3a57;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.id_badge_approved {
+  border-color: #bfead6;
+  background: #e9fbf2;
+  color: #0f5f3a;
+}
+.id_badge_rejected {
+  border-color: #ffd0d0;
+  background: #fff2f2;
+  color: #a11a1a;
+}
+.id_badge_partial {
+  border-color: #ffe1ad;
+  background: #fff8ea;
+  color: #7a4c00;
+}
+.id_badge_need_info,
+.id_badge_cannot_determine {
+  border-color: #ededed;
+  background: #f7f7f7;
+  color: #6b6b6b;
+}
+
+

@@ -102,6 +102,24 @@ MONGO_URI = (
     os.getenv("MONGO_URI")
 )
 
+def _optional_positive_int_env(var_name: str):
+    """Return a positive int from env var, otherwise None (unset/invalid/<=0)."""
+    raw = (os.getenv(var_name) or "").strip()
+    if not raw:
+        return None
+    try:
+        val = int(raw)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+# Milvus retrieval sizing:
+# - MILVUS_RETRIEVER_K controls the vector search top-k used by LangChain retrievers.
+# - MILVUS_MAX_RETURN_CHUNKS controls how many chunks we return to the API (None = no cap).
+MILVUS_RETRIEVER_K = _optional_positive_int_env("MILVUS_RETRIEVER_K") or 25
+MILVUS_FALLBACK_K = _optional_positive_int_env("MILVUS_FALLBACK_K") or MILVUS_RETRIEVER_K
+MILVUS_MAX_RETURN_CHUNKS = _optional_positive_int_env("MILVUS_MAX_RETURN_CHUNKS")
+
 CLEAR_STATE_ALIASES = {
     # Abbreviation -> collection prefix used in Milvus
     "AZ": "Arizona",
@@ -118,7 +136,7 @@ CLEAR_STATE_ALIASES = {
 _PLACEHOLDER_CHUNK_VALUES = {
     "[]",
     "",
-    "(No relevant chunks returned from Milvus)",
+    "(No supporting excerpts found)",
 }
 
 def normalize_contract_type(contract_type: str) -> str:
@@ -990,29 +1008,6 @@ def filter_relevant_customer_questions(questions: List[Dict]) -> List[Dict]:
     if not questions:
         return []
     
-    # Keywords that indicate relevant customer questions
-    relevant_keywords = [
-        'coverage', 'covered', 'cover', 'covers',
-        'repair', 'repairs', 'repairing', 'repaired',
-        'damage', 'damages', 'damaged', 'damaging',
-        'broken', 'break', 'breaks', 'broke',
-        'leak', 'leaking', 'leaked', 'leaks',
-        'limit', 'limits', 'limitless',
-        'policy', 'policies', 'plan', 'plans',
-        'contract', 'contracts',
-        'appliance', 'appliances',
-        'service', 'services',
-        'claim', 'claims',
-        'warranty', 'warranties',
-        'replace', 'replacement', 'replacing',
-        'fix', 'fixing', 'fixed',
-        'work', 'working', 'works',
-        'problem', 'problems', 'issue', 'issues',
-        'cost', 'costs', 'price', 'prices', 'pricing',
-        'include', 'includes', 'including',
-        'exclude', 'excludes', 'excluding'
-    ]
-    
     # Keywords/phrases that indicate customer service rep questions (to exclude)
     rep_question_patterns = [
         'can i have your',
@@ -1023,7 +1018,7 @@ def filter_relevant_customer_questions(questions: List[Dict]) -> List[Dict]:
         'what is your',
         'do you have',
         'are you',
-        'is this',
+        # Note: keep this list conservative; generic phrases like "is this" can appear in customer questions.
         'can you confirm',
         'would you like',
         'how can i help',
@@ -1036,25 +1031,21 @@ def filter_relevant_customer_questions(questions: List[Dict]) -> List[Dict]:
     filtered_questions = []
     
     for question_obj in questions:
-        question_text = question_obj.get('question', '').lower()
-        context_text = question_obj.get('context', '').lower()
+        question_text_raw = (question_obj.get('question', '') or '').strip()
+        if not question_text_raw:
+            continue
+        question_text = question_text_raw.lower()
+        context_text = (question_obj.get('context', '') or '').lower()
         combined_text = f"{question_text} {context_text}"
         
         # Check if it's a rep question (exclude these)
         is_rep_question = any(pattern in combined_text for pattern in rep_question_patterns)
         if is_rep_question:
             continue
-        
-        # Check if it contains relevant keywords or is about customer problems
-        has_relevant_keyword = any(keyword in combined_text for keyword in relevant_keywords)
-        
-        # Check question type if available
-        question_type = question_obj.get('questionType', '').lower()
-        is_relevant_type = question_type in ['coverage', 'limit', 'repair', 'damage', 'policy', 'claim']
-        
-        # Include if it has relevant keywords OR relevant question type OR seems to be about customer problems
-        if has_relevant_keyword or is_relevant_type or 'customer' in combined_text or 'problem' in combined_text or 'issue' in combined_text:
-            filtered_questions.append(question_obj)
+
+        # We rely primarily on the LLM prompt to extract only customer-intent items.
+        # Keep this filter permissive to avoid dropping valid intents (especially implicit/process questions).
+        filtered_questions.append(question_obj)
     
     return filtered_questions
 
@@ -1067,54 +1058,95 @@ def extract_relevant_customer_questions(transcript_content: str, llm) -> List[Di
     
     This function is specifically designed for the Calls section (/transcripts/process endpoint).
     """
-    extraction_prompt = ChatPromptTemplate.from_template(
-        """
-        You are an expert at analyzing customer service transcripts and extracting relevant customer questions to achieve complete customer satisfaction.
-        
-        Take the customer's perspective: infer what the CUSTOMER needs to fully resolve their issue. If the transcript has no explicit questions (or is spoken by a technician/representative), infer and create the questions needed for resolution.
-        
-        Focus ONLY on questions related to:
-        1. Coverage lookup (e.g., "Is X covered?", "What's covered?", "Does my plan cover Y?", "Is this covered under my contract?")
-        2. Damage/repair issues (e.g., "Will you repair X?", "Is this damage covered?", "My appliance is broken", "The tank is leaking")
-        3. Coverage limits and policies (e.g., "What's the limit?", "How much coverage?", "What does my plan include?")
-        4. Customer problems they're facing (e.g., "My water heater is leaking", "The refrigerator stopped working", "There's damage to my floor")
-        5. Clarifying sub-questions that help resolve the customer’s problem end-to-end (e.g., specifics about item, location of damage, circumstances, causes, limits, costs, approvals) when implied by the situation.
-        
+
+    # Optimized extraction prompt with 3-step process: Understand Intent → Frame Question → Extract
+    extraction_prompt_template = """
+        You are an expert at analyzing customer service transcripts. Take the customer's perspective to understand what they need, then break that need into clear questions required to fully resolve it. Use a structured 3-step process, and infer questions even when none are explicitly asked (including when described by a technician/representative).
+
+        STEP 1: UNDERSTAND USER INTENT
+        - Put yourself in the customer’s shoes; aim for complete customer satisfaction.
+        - Accept signals from any speaker (customer, technician, representative) describing the customer’s issue.
+        - Include implicit clarifications needed to resolve the situation end-to-end (item, location, cause, limits, costs, approvals).
+
+        Focus on customer statements that express:
+        - Intent to understand coverage (e.g., "I want to know if...", "Is this covered?", "Will you repair...")
+        - Intent to understand problems (e.g., "My appliance is...", "There's a leak...", "The damage is...")
+        - Intent to understand policies (e.g., "What's the limit?", "How much does it cost?", "What's included?")
+
         EXCLUDE:
-        - Customer service representative administrative questions (e.g., "Can I have your name?", "What's your position?", "May I know...", "How can I help you?")
-        - Pure admin questions
-        - Questions not related to coverage/repair/damage/contract/policy
+        - Customer service representative questions (e.g., "Can I have your name?", "What's your position?", "May I know...", "How can I help you?")
+        - Administrative questions
         - Greetings or pleasantries
-        
-        Identify questions by understanding the context and speaker intent (customer or tech/rep describing the customer’s issue). Act as if you are the customer articulating their needs:
-        - Express concerns about their property/appliances
-        - Ask about coverage, repair, or policy details
-        - Describe problems they're experiencing
-        - Ask about what's included in their contract/plan
-        - Ask clarifiers needed to resolve their issue end-to-end
-        - If no explicit questions exist, infer and produce questions (at least one per distinct issue)
-        
-        Transcript:
-        {transcript}
-        
+        - Questions not related to coverage/repair/damage/contract/policy
+
+        STEP 2: FRAME THE QUESTIONS
+        For each identified customer intent, frame it as a clear, atomic question that can be answered independently. Frame questions in a way that:
+        - Captures the customer's actual concern or problem (in their voice)
+        - Is specific and answerable from contract knowledge base
+        - Focuses on coverage, damage, repair, policy, and any clarifiers needed to resolve the issue
+        - If no explicit questions are present, infer and create them. Ensure at least one question per described issue.
+
+        HARD REQUIREMENTS (Calls mode):
+        - Do NOT write generic questions like "Is it covered?", "Is this covered?", "Is that covered?" or "Is it covered or not?".
+        - Every question must be CUSTOMER-SPECIFIC: explicitly mention the appliance/system and the specific issue/service (symptom/part/service).
+        - Avoid vague pronouns ("it/this/that") unless you immediately clarify the appliance/issue in the same sentence.
+        - Generate a compact but complete set of questions that covers WH-style checks as QUESTIONS when implied by the case:
+          - What failed / what service is needed
+          - Where (location / affected area / on/off premises when relevant)
+          - When (timing, waiting period, recent repair when relevant)
+          - Why (suspected cause, secondary damage, misuse/commercial use when relevant)
+          - How (repair vs replace, diagnostics, service call/trade call, limits/fees)
+        - Keep questions clean and professional; no filler, no disclaimers.
+
+        Question types to frame:
+        1. Coverage questions (contextual): "Does my plan cover diagnosing/repairing/replacing [appliance/part] for [specific failure mode]?"
+        2. Damage/repair questions (contextual): "Does the plan cover [specific repair/service] for [specific damage/failure] and under what limits/fees?"
+        3. Policy/limit questions: "What is the [specific limit/policy] for [item]?"
+        4. Problem statements: Convert customer problems into questions that include appliance + failure mode + requested service.
+        5. Clarifying questions that help resolve the customer’s need (e.g., specifics about the item, location, cause, or limits that determine coverage)
+
+        STEP 3: EXTRACT AND RETRIEVE
+        Extract the framed questions with proper context and question type classification.
+
+Transcript:
+{transcript}
+
+        Follow this 3-step process:
+        1. Identify customer intents (what they want to know/understand)
+        2. Frame each intent as a clear, atomic question
+        3. Extract and return the questions
+
         Return ONLY a JSON array of relevant customer questions in this format:
-        [
-            {{
-                "question": "Is the water heater leak covered under my plan?",
-                "context": "Customer mentioned their water heater tank is leaking and causing floor damage",
-                "questionType": "coverage"
+[
+  {{
+                "question": "Does my plan cover diagnosing and repairing my water heater tank leak described in the transcript, including any covered parts/labor and applicable fees?",
+                "context": "Customer mentioned their water heater tank is leaking and causing floor damage; customer wants to know coverage for the leak and related service",
+                "questionType": "coverage",
+                "userIntent": "Customer wants to understand if the water heater leak they're experiencing is covered by their plan"
             }},
             {{
-                "question": "What is the repair limit for this contract?",
-                "context": "Customer asked about repair costs and coverage limits",
-                "questionType": "limit"
-            }}
-        ]
-        
-        Extract only relevant customer questions. Return only valid JSON, no additional text.
-        If no relevant customer questions are found, return an empty array [].
-        """
-    )
+                "question": "What are the out of pocket costs for uncovered repairs?",
+                "context": "Customer asked about homeowner's financial responsibility when repair is not covered",
+                "questionType": "coverage",
+                "userIntent": "Customer wants to understand their financial responsibility for uncovered repairs"
+            }},
+            {{
+                "question": "Do you cover leak detection for a backyard copper line leak?",
+                "context": "Customer/tech described backyard leak with unknown exact source and recommended leak detection",
+                "questionType": "coverage",
+                "userIntent": "Customer wants to know if leak detection for this scenario is covered"
+  }}
+]
+
+        IMPORTANT:
+        - Extract only questions that reflect customer intent (not rep questions)
+        - Frame questions clearly and specifically
+        - Include userIntent field to show what the customer is trying to understand
+        - Return only valid JSON, no additional text
+        - If no relevant customer questions are found, return an empty array []
+    """
+
+    extraction_prompt = ChatPromptTemplate.from_template(extraction_prompt_template)
     
     extraction_chain = extraction_prompt | llm | StrOutputParser()
     
@@ -1152,6 +1184,13 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
     
     This function is specifically designed for the Calls section (/transcripts/process endpoint).
     """
+    """
+    Extract relevant customer questions from transcript using an agent-based approach.
+    Uses the same extraction prompt and filtering logic as extract_relevant_customer_questions()
+    to ensure consistency with Search/Infer functionality.
+    
+    This function is specifically designed for the Calls section (/transcripts/process endpoint).
+    """
     # Optimized extraction prompt with 3-step process: Understand Intent → Frame Question → Extract
     extraction_prompt_template = """
         You are an expert at analyzing customer service transcripts. Take the customer's perspective to understand what they need, then break that need into clear questions required to fully resolve it. Use a structured 3-step process, and infer questions even when none are explicitly asked (including when described by a technician/representative).
@@ -1179,18 +1218,30 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
         - Focuses on coverage, damage, repair, policy, and any clarifiers needed to resolve the issue
         - If no explicit questions are present, infer and create them. Ensure at least one question per described issue.
 
+        HARD REQUIREMENTS (Calls mode):
+        - Do NOT write generic questions like "Is it covered?", "Is this covered?", "Is that covered?" or "Is it covered or not?".
+        - Every question must be CUSTOMER-SPECIFIC: explicitly mention the appliance/system and the specific issue/service (symptom/part/service).
+        - Avoid vague pronouns ("it/this/that") unless you immediately clarify the appliance/issue in the same sentence.
+        - Generate a compact but complete set of questions that covers WH-style checks as QUESTIONS when implied by the case:
+          - What failed / what service is needed
+          - Where (location / affected area / on/off premises when relevant)
+          - When (timing, waiting period, recent repair when relevant)
+          - Why (suspected cause, secondary damage, misuse/commercial use when relevant)
+          - How (repair vs replace, diagnostics, service call/trade call, limits/fees)
+        - Keep questions clean and professional; no filler, no disclaimers.
+
         Question types to frame:
-        1. Coverage questions: "Is [specific item/issue] covered under my plan?"
-        2. Damage/repair questions: "Will you repair [specific problem]?" or "Is [specific damage] covered?"
+        1. Coverage questions (contextual): "Does my plan cover diagnosing/repairing/replacing [appliance/part] for [specific failure mode]?"
+        2. Damage/repair questions (contextual): "Does the plan cover [specific repair/service] for [specific damage/failure] and under what limits/fees?"
         3. Policy/limit questions: "What is the [specific limit/policy] for [item]?"
-        4. Problem statements: Convert customer problems into questions like "Is [problem description] covered?"
+        4. Problem statements: Convert customer problems into questions that include appliance + failure mode + requested service.
         5. Clarifying questions that help resolve the customer’s need (e.g., specifics about the item, location, cause, or limits that determine coverage)
 
         STEP 3: EXTRACT AND RETRIEVE
         Extract the framed questions with proper context and question type classification.
 
-        Transcript:
-        {transcript}
+Transcript:
+{transcript}
 
         Follow this 3-step process:
         1. Identify customer intents (what they want to know/understand)
@@ -1200,8 +1251,8 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
         Return ONLY a JSON array of relevant customer questions in this format:
         [
             {{
-                "question": "Is the water heater leak covered under my plan?",
-                "context": "Customer mentioned their water heater tank is leaking and causing floor damage. Customer wants to know if this specific leak is covered.",
+                "question": "Does my plan cover diagnosing and repairing my water heater tank leak described in the transcript, including any covered parts/labor and applicable fees?",
+                "context": "Customer mentioned their water heater tank is leaking and causing floor damage; customer wants to know coverage for the leak and related service",
                 "questionType": "coverage",
                 "userIntent": "Customer wants to understand if the water heater leak they're experiencing is covered by their plan"
             }},
@@ -1226,6 +1277,61 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
         - Return only valid JSON, no additional text
         - If no relevant customer questions are found, return an empty array []
     """
+    # Optimized extraction prompt with 3-step process: Understand Intent → Frame Question → Extract
+#     extraction_prompt_template = """
+# You are extracting customer-intent questions for an insurance claim from a transcript.
+
+# Extract items ONLY if they represent a customer intent, need, question, confusion, objection, request, or decision point.
+# Include both explicit questions and implicit questions (e.g., “I’m not sure what to do” → “What should I do next?”).
+
+# Do NOT extract agent/CSR questions unless the customer repeats/endorses them as their own concern.
+# Do NOT include pleasantries, small talk, or purely informational statements unless they imply a need.
+
+# No speculation. No invented facts.
+
+# You MUST capture the claim situation:
+# - Always include at least one canonical item that summarizes the primary claim the customer is calling about (what happened, what is damaged, what the customer wants us to do).
+# - If multiple items/damages are involved, include one item per distinct issue AND a primary claim item tying them together.
+ 
+# Coverage-model completeness (extract questions that map to real claim handling):
+# - Claim intake/triage: who is reporting, what happened (alleged cause), when, where, how discovered, urgency/safety/ongoing damage.
+# - Policy & eligibility gating: correct insured/asset/location, policy in force/waiting period, eligibility, limits & deductibles/sublimits.
+# - Coverage trigger: what must be true for coverage to apply (based on policy wording in general terms; do not invent).
+# - Causation/mechanism ("because"): sudden vs gradual, wear/tear vs accidental, contributing causes, sequence of events.
+# - Exclusions/limitations: identify likely carve-outs the customer is worried about and turn them into questions.
+# - Conditions/duties: notice, mitigation, documentation, proof-of-loss, preserve evidence, cooperation.
+# - Damages/scope/valuation: what is being claimed (repair/replacement/reimbursement), amounts/estimates, valuation method if implied.
+# - Process/timeline: claim filing steps, documents needed, expected timeline, next steps, appeal/dispute options.
+
+# For EACH extracted item:
+# - Make it atomic and customer-voiced (what the customer wants to know/do).
+# - Include a brief situation summary in context.
+# - Include 1–2 verbatim evidence quotes from the transcript inside the context field as:
+#   Evidence: “...” / “...”
+# - Assign an appropriate questionType.
+# - Include userIntent.
+
+# De-duplicate repeated intents into one canonical question (keep the most specific wording).
+
+# Completeness rule:
+# - Do NOT limit the number of extracted items. Include ALL distinct customer intents present in the transcript.
+#  - If the transcript implies uncertainty that blocks a decision, extract a targeted question to resolve it (exactly what is missing).
+
+# Transcript:
+# {transcript}
+
+# Return ONLY valid JSON (no markdown, no extra text) as a JSON array:
+# [
+#   {{
+#     "question": "string",
+#     "context": "1–3 sentences situation summary. Evidence: “...” / “...”",
+#     "questionType": "coverage|limit|exclusion|eligibility|process|cost|timeline|status|next_steps|repair|damage|policy|claim|other",
+#     "userIntent": "string"
+#   }}
+# ]
+
+# If no relevant customer intents are present, return [].
+#     """
     
     # Create a tool that uses the extraction prompt
     def extract_questions_tool(transcript: str) -> str:
@@ -1263,23 +1369,21 @@ def extract_questions_with_agent(transcript_content: str, llm) -> List[Dict]:
     
     # System message for the agent - optimized with 3-step process
     agent_sys_msg = """
-    You are an expert at analyzing customer service transcripts and extracting relevant customer questions using a structured 3-step approach.
+You are a claims transcript extraction supervisor.
 
-    Your task is to use the Transcript Question Extractor tool to:
-    1. UNDERSTAND USER INTENT: Identify what the customer is trying to understand or find out
-    2. FRAME QUESTIONS: Convert customer intents into clear, atomic questions
-    3. EXTRACT & RETRIEVE: Extract the framed questions with proper context
+Use the tool "Transcript Question Extractor" with the full transcript.
 
-    The transcript contains a conversation between a customer and a customer service representative.
-    Focus on questions asked by the CUSTOMER (not the representative) that are related to:
-    - Coverage lookup (what's covered, is X covered, etc.)
-    - Damage/repair issues (appliance problems, repairs needed, etc.)
-    - Coverage limits and policies (limits, what's included, etc.)
-    - Customer problems they're facing (leaks, breakdowns, damage, etc.)
+Your success criteria:
+- Extract ONLY customer intents (explicit or implicit): needs, questions, confusion, objections, requests, decision points.
+- Exclude CSR/admin questions unless the customer explicitly adopts them.
+- De-duplicate repeated intents into one canonical question.
+- Output MUST be ONLY a valid JSON array of objects with:
+  question, context (including 1–2 evidence quotes), questionType, userIntent
 
-    Use the Transcript Question Extractor tool with the full transcript content.
-    The tool will follow the 3-step process (understand intent → frame question → extract) and return a JSON array of questions.
-    Return the result as-is from the tool.
+Hard rule:
+- If the tool output contains any non-JSON text, fix it and return ONLY the JSON array.
+
+Return the final JSON array and nothing else.
     """
     
     # LangChain AgentExecutor expects a BaseMemory, not a ChatMessageHistory.
@@ -1459,16 +1563,34 @@ def extract_atomic_questions(transcript_content: str, llm) -> List[Dict]:
         return []
 
 
-def process_single_transcript_question(question: str, contract_type: str, selected_plan: str, 
-                                     selected_state: str, gpt_model: str, vector_db: Milvus, 
-                                     llm, llm2, retriever, handler) -> Dict:
+def process_single_transcript_question(
+    question: str,
+    contract_type: str,
+    selected_plan: str,
+    selected_state: str,
+    gpt_model: str,
+    vector_db: Milvus,
+    llm,
+    llm2,
+    retriever,
+    handler,
+    transcript_context: str = "",
+) -> Dict:
     """
     Process a single question from transcript and return answer with chunks
     Reuses logic from /start endpoint but without conversation context
     """
     try:
         q_start_time = time()
-        standalone_result = question  # No conversation context for transcript questions
+        # No conversation context for transcript questions, but we CAN pass the transcript-derived
+        # situation/evidence as part of the query to improve retrieval + answer relevance.
+        # Keep the user-visible question unchanged elsewhere; only enrich the internal query.
+        standalone_result = question
+        enriched_query = (
+            f"{question}\n\nTranscript situation/evidence:\n{transcript_context}".strip()
+            if (transcript_context or "").strip()
+            else question
+        )
         
         print(
             "[CHUNKS] process_single_transcript_question: START "
@@ -1479,15 +1601,46 @@ def process_single_transcript_question(question: str, contract_type: str, select
 
         if gpt_model == "Search":
             prompt_template = """
-            You are assisting a customer care executive. Your role is to review the contract's contextual information given in the context below.
+You are a professional insurance claims representative (CSR). Be empathetic, firm, and to the point.
 
-            {context}
+Use ONLY the policy/contract context provided below. Do NOT speculate or invent facts.
 
-            Answer the given user inquiry based on context above as truthfully as possible, providing in-depth explanations together with answers to the inquiries.
-            You may rephrase the final response to make it concise and sound more human-like, but do not go out of context and do not lose important details and meaning.
+Claims can be informational or coverage-related. Act accordingly:
+- If the question is about process/timeline/documents/next steps/costs, answer informatively with clear steps.
+- If the question is about coverage/limits/exclusions/eligibility, use a universal decision posture and give a clear determination using available facts from the context.
 
-            Question: {question}
-            Answer: """
+Avoid “if/then” branching answers.
+
+Universal decision posture model (choose ONE):
+- ACCEPT_AND_PAY: trigger met, no applicable exclusions, conditions met, scope/valuation supported
+- ACCEPT_PARTIAL: some components covered, others excluded/limited; apply deductible/sublimits/depreciation if stated
+- DENY: trigger not met, exclusion applies, policy not in force/eligible (if stated)
+- REQUEST_INFO: insufficient evidence; request specific items needed and why
+- RESERVE_RIGHTS: potential coverage issues; continue investigation while reserving rights (only if the context supports this posture)
+
+If required information is missing to make a determination:
+1) State what CAN be concluded from known facts,
+2) State what CANNOT be concluded,
+3) State exactly what you need next (documents/details) and the next step.
+
+Make the answer accountable so follow-up WH-questions are answerable:
+- Include a short "Why" line grounded in the provided context.
+- Include a short "Policy basis" line quoting 1–2 exact clause snippets from the provided context.
+- Include "Next step" if anything is missing or a process step is required.
+Keep these accountability lines short.
+
+Policy/contract context (verbatim):
+{context}
+
+Customer question:
+{question}
+
+Answer format:
+- Answer: (2–6 sentences, decisive, no hypotheticals)
+- Why: (1 short sentence)
+- Policy basis: (quote 1–2 short clause snippets)
+- Next step: (if applicable; otherwise say "No further action needed.")
+"""
             
             PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
             chain_type_kwargs = {"prompt": PROMPT}
@@ -1500,7 +1653,7 @@ def process_single_transcript_question(question: str, contract_type: str, select
             
             print("[CHUNKS] process_single_transcript_question: calling QA chain (Search)")
             qa_response = qa.invoke(
-                {"query": standalone_result},
+                {"query": enriched_query},
                 config={"callbacks": [handler]},
             )
             answer = qa_response["result"] if isinstance(qa_response, dict) else qa_response
@@ -1510,7 +1663,7 @@ def process_single_transcript_question(question: str, contract_type: str, select
             )
 
             print("[CHUNKS] process_single_transcript_question: calling relevant_docs (Search)")
-            relevant_documents = relevant_docs(standalone_result, retriever=retriever)
+            relevant_documents = relevant_docs(enriched_query, retriever=retriever)
             print(
                 "[CHUNKS] process_single_transcript_question: relevant_documents string length "
                 f"len={len(relevant_documents)}"
@@ -1519,7 +1672,7 @@ def process_single_transcript_question(question: str, contract_type: str, select
         elif gpt_model == "Infer":
             print("[CHUNKS] process_single_transcript_question: building QA chain (Infer)")
             qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, verbose=True)
-            agent_response = input_prompt(standalone_result, qa, llm)
+            agent_response = input_prompt(enriched_query, qa, llm)
             answer = agent_response["output"]
             print(
                 "[CHUNKS] process_single_transcript_question: agent_response received "
@@ -1558,17 +1711,17 @@ def process_single_transcript_question(question: str, contract_type: str, select
         chunk_details = []
         try:
             # First attempt: retriever (normal path)
-            docs_for_chunks = retriever.get_relevant_documents(standalone_result)
+            docs_for_chunks = retriever.get_relevant_documents(enriched_query)
             if not docs_for_chunks:
                 # Fallbacks to ensure we still fetch something from Milvus
                 fallback_queries = [
-                    f"{question} {contract_type} {selected_plan} {selected_state}",
+                    f"{enriched_query} {contract_type} {selected_plan} {selected_state}",
                     f"{contract_type} {selected_plan} contract coverage",
                     "contract coverage",
                 ]
                 for fq in fallback_queries:
                     try:
-                        docs_for_chunks = vector_db.similarity_search(fq, k=4)
+                        docs_for_chunks = vector_db.similarity_search(fq, k=MILVUS_FALLBACK_K)
                         if docs_for_chunks:
                             break
                     except Exception as e:
@@ -1581,7 +1734,11 @@ def process_single_transcript_question(question: str, contract_type: str, select
                 f"{len(docs_for_chunks)}"
             )
 
-            for doc in docs_for_chunks[:4]:
+            docs_iter = docs_for_chunks
+            if MILVUS_MAX_RETURN_CHUNKS is not None:
+                docs_iter = docs_for_chunks[:MILVUS_MAX_RETURN_CHUNKS]
+
+            for doc in docs_iter:
                 content = (getattr(doc, "page_content", "") or "").strip()
                 metadata = getattr(doc, "metadata", {}) or {}
                 if not content:
@@ -1594,7 +1751,7 @@ def process_single_transcript_question(question: str, contract_type: str, select
         if not chunk_texts:
             # As a last resort, still return a non-empty list (but keep it explicit for debugging).
             # This should be rare; most Milvus collections should return at least some results.
-            chunk_texts = ["(No relevant chunks returned from Milvus)"]
+            chunk_texts = ["(No supporting excerpts found)"]
         
         print(
             "[CHUNKS] process_single_transcript_question: FINAL "
@@ -1602,7 +1759,9 @@ def process_single_transcript_question(question: str, contract_type: str, select
         )
 
         # Log the exact chunks that will be returned with this question
-        returned_chunks = chunk_texts[:4]
+        returned_chunks = chunk_texts
+        if MILVUS_MAX_RETURN_CHUNKS is not None:
+            returned_chunks = chunk_texts[:MILVUS_MAX_RETURN_CHUNKS]
         print(
             "[CHUNKS] process_single_transcript_question: returning relevantChunks="
             f"{[c[:200].replace(chr(10), ' ') for c in returned_chunks]}"
@@ -1611,9 +1770,13 @@ def process_single_transcript_question(question: str, contract_type: str, select
         return {
             "answer": answer,
             # API contract: array of strings
-            "relevantChunks": returned_chunks,  # Limit to top 4 chunks
+            "relevantChunks": returned_chunks,
             # Keep details for optional persistence/debugging
-            "relevantChunksDetail": chunk_details[:4],
+            "relevantChunksDetail": (
+                chunk_details[:MILVUS_MAX_RETURN_CHUNKS]
+                if MILVUS_MAX_RETURN_CHUNKS is not None
+                else chunk_details
+            ),
             "confidence": 0.90,  # Default confidence, can be calculated from LLM
             "latency": q_latency
         }
@@ -1944,7 +2107,7 @@ def start():
                     with tracer.start_span('llm-retriever-initialization', child_of=parent1):
                         llm2 = ChatOpenAI(temperature=0.0, model="ft:gpt-3.5-turbo-0613:mindstix::8YYD56aA")
                         llm = ChatOpenAI(temperature=0.0, model="gpt-4o")
-                        retriever = vector_db1.as_retriever(search_kwargs={"k": 4})
+                        retriever = vector_db1.as_retriever(search_kwargs={"k": MILVUS_RETRIEVER_K})
                     
                     with tracer.start_span('memory_update', child_of=parent1):
                         memory1.clear()
@@ -2076,7 +2239,7 @@ def start():
                         llm3 = ChatOpenAI(temperature=0.0, model="ft:gpt-3.5-turbo-0613:mindstix::8YYD56aA")
                         llm = ChatOpenAI(temperature=0.0, model='gpt-4o')
                         llm2 = ChatOpenAI(temperature=0.0, model='gpt-4o')
-                        retriever = vector_db1.as_retriever(search_kwargs={"k": 4})
+                        retriever = vector_db1.as_retriever(search_kwargs={"k": MILVUS_RETRIEVER_K})
                         
                     with tracer.start_span('memory_update', child_of=parent1):
                         memory1.clear()
@@ -3348,16 +3511,28 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
-def generate_claim_decision_from_chunks(chunks: List[str], llm=None) -> Dict:
+def generate_claim_decision_from_chunks(chunks: List[str], llm=None, claims_context: List[Dict] = None) -> Dict:
     """
     Produce a single claim authorization decision grounded ONLY in provided policy chunks.
 
     Returns:
       {
-        "decision": "APPROVED"|"REJECTED"|"CANNOT_DETERMINE",
+        "decision": "APPROVED"|"REJECTED"|"PARTIAL"|"CANNOT_DETERMINE",
         "shortAnswer": "...",
         "reasons": ["...", "..."],
-        "citedChunks": ["...", "..."]
+        "citedChunks": ["...", "..."],
+        "claims": [
+          {
+            "claimId": "c1",
+            "items": [{"name": "...", "details": "..."}],
+            "situation": "...",
+            "decision": "APPROVED|REJECTED|PARTIAL|CANNOT_DETERMINE|REQUEST_INFO",
+            "decisionSummary": "one sentence",
+            "reasons": ["..."],
+            "policyBasis": ["short quoted fragment", "..."],
+            "nextSteps": ["..."]
+          }
+        ]
       }
     """
     cleaned = [str(c).strip() for c in (chunks or []) if str(c).strip()]
@@ -3370,51 +3545,100 @@ def generate_claim_decision_from_chunks(chunks: List[str], llm=None) -> Dict:
             "shortAnswer": "I can’t confirm approval or rejection from the policy text provided.",
             "reasons": ["No relevant policy clauses were retrieved to support a decision."],
             "citedChunks": [],
+            "claims": [],
         }
 
     try:
         if llm is None:
             llm = ChatOpenAI(temperature=0.0, model="gpt-4o-mini")
 
+        # Normalize claim contexts into a compact blob for the model.
+        claim_lines = []
+        if isinstance(claims_context, list):
+            for i, c in enumerate(claims_context):
+                if not isinstance(c, dict):
+                    continue
+                cid = (c.get("claimId") or f"c{i+1}").strip()
+                claim_text = (c.get("customerClaim") or c.get("claim") or c.get("question") or "").strip()
+                situation = (c.get("situation") or c.get("context") or "").strip()
+                if not (claim_text or situation):
+                    continue
+                line = f"- claimId: {cid}\n  claim: {claim_text or '(not provided)'}"
+                if situation:
+                    line += f"\n  situation: {situation}"
+                claim_lines.append(line)
+
+        claims_blob = "\n".join(claim_lines).strip()
+        if not claims_blob:
+            claims_blob = "- claimId: c1\n  claim: (No explicit claim description provided)\n  situation: (Not provided)"
+
         prompt = ChatPromptTemplate.from_template(
             """
-You are a claim authorization assistant. Decide whether the claim should be APPROVED, REJECTED, or CANNOT_DETERMINE.
+You are a claims adjudication assistant. You must produce an overall decision AND a per-claim breakdown.
+
+Decisions allowed:
+- APPROVED: covered as described by the policy chunks
+- REJECTED: clearly excluded/not covered by the policy chunks
+- PARTIAL: some items/parts/situations are covered while others are excluded/limited
+- CANNOT_DETERMINE: policy chunks are insufficient/ambiguous for a firm decision
+- REQUEST_INFO (per-claim only): you need specific missing details to decide
 
 CRITICAL RULES:
 - Use ONLY the policy chunks provided below as evidence.
 - Do NOT assume anything not explicitly stated in the chunks.
+- Do NOT speculate or invent facts.
 - If the chunks are insufficient/ambiguous to decide, output CANNOT_DETERMINE.
-- Keep the language short and human (customer-friendly).
-- Provide 2 to 4 short reasons. Each reason must clearly map to a clause in the chunks.
+- Keep the language short, professional, and customer-friendly.
+- You MUST address EACH claim listed under "Customer claims" (one entry per claimId).
+- For each claim, list the item/items being claimed, and the situation/context in which the customer is claiming them.
+- If the customer is claiming multiple items or multiple situations, set the per-claim decision to PARTIAL and explain what is/ isn’t covered.
+- Provide 2 to 4 short overall reasons.
+- Each overall reason MUST directly map to the provided chunks and include a short quoted fragment (in quotes).
 - Also return citedChunks: include only the 1–3 chunk strings you relied on most.
 
 Return ONLY valid JSON in exactly this schema:
 {{
-  "decision": "APPROVED|REJECTED|CANNOT_DETERMINE",
+  "decision": "APPROVED|REJECTED|PARTIAL|CANNOT_DETERMINE",
   "shortAnswer": "one sentence",
   "reasons": ["reason1","reason2"],
-  "citedChunks": ["chunk1","chunk2"]
+  "citedChunks": ["chunk1","chunk2"],
+  "claims": [
+    {{
+      "claimId": "c1",
+      "items": [{{"name":"...","details":"..."}}],
+      "situation": "short situation description (from claim context)",
+      "decision": "APPROVED|REJECTED|PARTIAL|CANNOT_DETERMINE|REQUEST_INFO",
+      "decisionSummary": "one sentence",
+      "reasons": ["reason1","reason2"],
+      "policyBasis": ["quoted fragment 1","quoted fragment 2"],
+      "nextSteps": ["specific next step 1"]
+    }}
+  ]
 }}
 
-Policy chunks:
+Customer claims (use this ONLY to understand what is being claimed; policy evidence must come from chunks):
+{claims}
+
+Policy chunks (verbatim):
 {chunks}
 """
         )
 
         chain = prompt | llm | StrOutputParser()
-        chunks_blob = "\n\n---\n\n".join(cleaned[:8])
-        raw = (chain.invoke({"chunks": chunks_blob}) or "").strip()
+        chunks_blob = "\n\n---\n\n".join(cleaned[:12])
+        raw = (chain.invoke({"chunks": chunks_blob, "claims": claims_blob}) or "").strip()
         raw = re.sub(r"```json\\n?", "", raw)
         raw = re.sub(r"```\\n?", "", raw)
         raw = raw.strip()
         data = json.loads(raw)
 
         decision = (data.get("decision") or "").strip().upper()
-        if decision not in ("APPROVED", "REJECTED", "CANNOT_DETERMINE"):
+        if decision not in ("APPROVED", "REJECTED", "PARTIAL", "CANNOT_DETERMINE"):
             decision = "CANNOT_DETERMINE"
         short_answer = (data.get("shortAnswer") or "").strip()
         reasons = data.get("reasons") or []
         cited = data.get("citedChunks") or []
+        claims = data.get("claims") or []
 
         if not isinstance(reasons, list):
             reasons = []
@@ -3432,11 +3656,51 @@ Policy chunks:
             # Default to first chunk(s) if model didn't provide citations
             cited = cleaned[:2]
 
+        # Best-effort validation for claims array (keep backwards-compatible shape if model output is off).
+        if not isinstance(claims, list):
+            claims = []
+        cleaned_claims = []
+        for i, c in enumerate(claims):
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("claimId") or f"c{i+1}").strip()
+            items = c.get("items") or []
+            if not isinstance(items, list):
+                items = []
+            normalized_items = []
+            for it in items:
+                if isinstance(it, dict):
+                    nm = (it.get("name") or "").strip()
+                    det = (it.get("details") or "").strip()
+                    if nm or det:
+                        normalized_items.append({"name": nm, "details": det})
+                else:
+                    s = str(it).strip()
+                    if s:
+                        normalized_items.append({"name": s, "details": ""})
+            per_dec = str(c.get("decision") or "").strip().upper()
+            if per_dec not in ("APPROVED", "REJECTED", "PARTIAL", "CANNOT_DETERMINE", "REQUEST_INFO"):
+                per_dec = "CANNOT_DETERMINE"
+            cleaned_claims.append(
+                {
+                    "claimId": cid,
+                    "items": normalized_items,
+                    "situation": str(c.get("situation") or "").strip(),
+                    "decision": per_dec,
+                    "decisionSummary": str(c.get("decisionSummary") or "").strip(),
+                    "reasons": [str(x).strip() for x in (c.get("reasons") or []) if str(x).strip()][:5],
+                    "policyBasis": [str(x).strip() for x in (c.get("policyBasis") or []) if str(x).strip()][:5],
+                    "nextSteps": [str(x).strip() for x in (c.get("nextSteps") or []) if str(x).strip()][:5],
+                }
+            )
+
         if not short_answer:
             if decision == "APPROVED":
                 short_answer = "Your claim appears approved based on the policy clauses provided."
             elif decision == "REJECTED":
                 short_answer = "Your claim appears rejected based on the policy clauses provided."
+            elif decision == "PARTIAL":
+                short_answer = "Your claim appears partially covered based on the policy clauses provided."
             else:
                 short_answer = "I can’t confirm approval or rejection from the policy text provided."
 
@@ -3445,6 +3709,7 @@ Policy chunks:
             "shortAnswer": short_answer,
             "reasons": reasons,
             "citedChunks": cited,
+            "claims": cleaned_claims,
         }
     except Exception as e:
         print(f"Warning: claim decision generation failed: {e}")
@@ -3453,6 +3718,7 @@ Policy chunks:
             "shortAnswer": "I can’t confirm approval or rejection from the policy text provided.",
             "reasons": ["The system could not generate a grounded decision from the retrieved clauses."],
             "citedChunks": cleaned[:2],
+            "claims": [],
         }
 
 
@@ -3735,7 +4001,7 @@ def process_transcript_stream():
                 collection_name=selected_collection_name,
                 connection_args={"host": MILVUS_HOST, "port": "19530"},
             )
-            retriever = vector_db1.as_retriever(search_kwargs={"k": 4})
+            retriever = vector_db1.as_retriever(search_kwargs={"k": MILVUS_RETRIEVER_K})
 
             if gpt_model == "Search":
                 llm2 = ChatOpenAI(temperature=0.0, model="ft:gpt-3.5-turbo-0613:mindstix::8YYD56aA")
@@ -3776,6 +4042,7 @@ def process_transcript_stream():
                     llm2,
                     retriever,
                     handler,
+                    transcript_context=question_obj.get("context", ""),
                 )
 
                 result["questionId"] = question_id
@@ -3791,8 +4058,10 @@ def process_transcript_stream():
                 else:
                     rc = []
                 if not rc:
-                    rc = ["(No relevant chunks returned from Milvus)"]
-                result["relevantChunks"] = rc[:4]
+                    rc = ["(No supporting excerpts found)"]
+                if MILVUS_MAX_RETURN_CHUNKS is not None:
+                    rc = rc[:MILVUS_MAX_RETURN_CHUNKS]
+                result["relevantChunks"] = rc
 
                 if "error" not in result:
                     confidences.append(result.get("confidence", 0.0))
@@ -3853,18 +4122,45 @@ def process_transcript_stream():
                     q = (r.get("question") or "").strip()
                     if not q:
                         continue
+                    ctx = (r.get("context") or "").strip()
                     a = (r.get("answer") or "").strip() or "(No answer was generated for this question.)"
-                    qa_lines.append(f"Q: {q}\nA: {a}")
+                    # Provide structured evidence for the final summarizer to cluster by appliance/item.
+                    if ctx:
+                        qa_lines.append(f"Q: {q}\nSituation: {ctx}\nA: {a}")
+                    else:
+                        qa_lines.append(f"Q: {q}\nA: {a}")
                 qa_blob = "\n\n".join(qa_lines)
                 if qa_blob.strip():
                     summary_prompt = PromptTemplate(
                         input_variables=["qa_blob"],
                         template=(
-                            "You are summarizing a transcript Q&A.\n"
-                            "Write a combined final answer that summarizes the answers across ALL questions.\n"
-                            "Do not omit any question's outcome; merge duplicates instead of dropping them.\n"
-                            "Focus on decisions/coverage outcomes, key exclusions/conditions, and next steps.\n"
-                            "Keep it under 10 bullet points.\n\n"
+                            "You are writing the FINAL ANSWER for a claims transcript.\n"
+                            "IMPORTANT: Do NOT present the final answer as a list of each Q&A.\n"
+                            "Instead, synthesize ALL Q&A into an APPLIANCE/ITEM-BASED final answer.\n"
+                            "\n"
+                            "Task:\n"
+                            "- Identify the distinct appliance(s)/item(s)/system(s) mentioned across the Q&A.\n"
+                            "- Group/merge related questions into the correct item section (do not repeat the questions).\n"
+                            "- If the transcript includes multiple items with separate claims, show them as separate sections.\n"
+                            "\n"
+                            "For EACH item section, include:\n"
+                            "- Item : <1,2,3...>\n"
+                            "- Item: <name> (add 1-line details if available: location/part/symptom)\n"
+                            "- Type: Appliance | System | Fixture | Other (infer from wording; if unclear use Other)\n"
+                            "- Related: related parts/components/secondary-damage items (if any)\n"
+                            "- Situation: what happened / what customer is claiming (from Situation lines)\n"
+                            "- Decision: APPROVED | REJECTED | PARTIAL | NEED_INFO\n"
+                            "- What’s covered (bullet list, if any)\n"
+                            "- What’s not covered / limitations (bullet list, if any)\n"
+                            "- Amounts (only if mentioned in Q&A):\n"
+                            "  - Customer quoted/asked: $...\n"
+                            "  - Company can provide: $... (coverage amount/limit/service fee/deductible as stated in Q&A)\n"
+                            "- Why (1–2 short sentences grounded in the Q&A outcomes; no policy speculation)\n"
+                            "- Next steps (specific actions the customer should take)\n"
+                            "\n"
+                            "If outcomes are mixed for the same item, use PARTIAL and clearly break down covered vs not covered.\n"
+                            "Be concise, decisive, and avoid hypothetical/if-then language.\n"
+                            "End with a short overall next step (1–2 bullets) if multiple items exist.\n\n"
                             "{qa_blob}\n"
                         ),
                     )
@@ -3898,7 +4194,18 @@ def process_transcript_stream():
                         continue
                     seen.add(c)
                     deduped.append(c)
-                claim_decision = generate_claim_decision_from_chunks(deduped)
+                claims_context = []
+                for r in results or []:
+                    if not isinstance(r, dict):
+                        continue
+                    claims_context.append(
+                        {
+                            "claimId": (r.get("questionId") or ""),
+                            "customerClaim": (r.get("question") or ""),
+                            "situation": (r.get("context") or ""),
+                        }
+                    )
+                claim_decision = generate_claim_decision_from_chunks(deduped, claims_context=claims_context)
                 yield _sse("claimDecision", claim_decision)
             except Exception as e:
                 print(f"Warning: failed to generate/stream claimDecision: {e}")
@@ -4108,8 +4415,10 @@ def process_transcript():
                         else:
                             rc = []
                         if not rc and q.get("questionId") != "final_answer":
-                            rc = ["(No relevant chunks returned from Milvus)"]
-                        q["relevantChunks"] = rc[:4]
+                            rc = ["(No supporting excerpts found)"]
+                        if MILVUS_MAX_RETURN_CHUNKS is not None:
+                            rc = rc[:MILVUS_MAX_RETURN_CHUNKS]
+                        q["relevantChunks"] = rc
                 except Exception as e:
                     print(f"Warning: failed to normalize cached relevantChunks: {e}")
 
@@ -4267,7 +4576,7 @@ def process_transcript():
                     connection_args={"host": MILVUS_HOST, "port": "19530"},
                 )
                 
-                retriever = vector_db1.as_retriever(search_kwargs={"k": 4})
+                retriever = vector_db1.as_retriever(search_kwargs={"k": MILVUS_RETRIEVER_K})
                 
                 if gpt_model == "Search":
                     llm2 = ChatOpenAI(temperature=0.0, model="ft:gpt-3.5-turbo-0613:mindstix::8YYD56aA")
@@ -4292,7 +4601,8 @@ def process_transcript():
                     result = process_single_transcript_question(
                         question_text, contract_type, selected_plan, 
                         selected_state, gpt_model, vector_db1, llm, llm2, 
-                        retriever, handler
+                        retriever, handler,
+                        transcript_context=question_obj.get("context", ""),
                     )
                     
                     result["questionId"] = question_id
@@ -4308,8 +4618,10 @@ def process_transcript():
                     else:
                         rc = []
                     if not rc:
-                        rc = ["(No relevant chunks returned from Milvus)"]
-                    result["relevantChunks"] = rc[:4]
+                        rc = ["(No supporting excerpts found)"]
+                    if MILVUS_MAX_RETURN_CHUNKS is not None:
+                        rc = rc[:MILVUS_MAX_RETURN_CHUNKS]
+                    result["relevantChunks"] = rc
 
                     rc = result.get("relevantChunks", [])
                     print(
@@ -4379,7 +4691,18 @@ def process_transcript():
                         continue
                     seen.add(c)
                     deduped.append(c)
-                claim_decision = generate_claim_decision_from_chunks(deduped)
+                claims_context = []
+                for r in results or []:
+                    if not isinstance(r, dict):
+                        continue
+                    claims_context.append(
+                        {
+                            "claimId": (r.get("questionId") or ""),
+                            "customerClaim": (r.get("question") or ""),
+                            "situation": (r.get("context") or ""),
+                        }
+                    )
+                claim_decision = generate_claim_decision_from_chunks(deduped, claims_context=claims_context)
                 response["claimDecision"] = claim_decision
             except Exception as e:
                 print(f"Warning: unable to generate claimDecision: {e}")
@@ -4398,23 +4721,48 @@ def process_transcript():
                         q = (r.get("question") or "").strip()
                         if not q:
                             continue
+                        ctx = (r.get("context") or "").strip()
                         a = (r.get("answer") or "").strip()
                         # If answer is missing but question exists, keep a placeholder so the final summary
                         # still reflects ALL extracted questions.
                         if not a:
                             a = "(No answer was generated for this question.)"
-                        qa_lines.append(f"Q: {q}\nA: {a}")
+                        if ctx:
+                            qa_lines.append(f"Q: {q}\nSituation: {ctx}\nA: {a}")
+                        else:
+                            qa_lines.append(f"Q: {q}\nA: {a}")
 
                     qa_blob = "\n\n".join(qa_lines)
                     if qa_blob.strip():
                         summary_prompt = PromptTemplate(
                             input_variables=["qa_blob"],
                             template=(
-                                "You are summarizing a transcript Q&A.\n"
-                                "Write a combined final answer that summarizes the answers across ALL questions.\n"
-                                "Do not omit any question's outcome; merge duplicates instead of dropping them.\n"
-                                "Focus on decisions/coverage outcomes, key exclusions/conditions, and next steps.\n"
-                                "Keep it under 10 bullet points.\n\n"
+                                "You are writing the FINAL ANSWER for a claims transcript.\n"
+                                "IMPORTANT: Do NOT present the final answer as a list of each Q&A.\n"
+                                "Instead, synthesize ALL Q&A into an APPLIANCE/ITEM-BASED final answer.\n"
+                                "\n"
+                                "Task:\n"
+                                "- Identify the distinct appliance(s)/item(s)/system(s) mentioned across the Q&A.\n"
+                                "- Group/merge related questions into the correct item section (do not repeat the questions).\n"
+                                "- If the transcript includes multiple items with separate claims, show them as separate sections.\n"
+                                "\n"
+                                "For EACH item section, include in JSON FORMAT:\n"
+                                "- ITEM : <1,2,3...>\n"
+                                "- ITEM: <name> (add 1-line details if available: location/part/symptom)\n"
+                                "- TYPE: Appliance | System | Fixture | Other (infer from wording; if unclear use Other)\n"
+                                "- DECISION: APPROVED | REJECTED | PARTIAL | NEED_HUMAN_ASSISTANCE\n"
+                                "- AMOUNTS (only if mentioned in Q&A):\n"
+                                "  1. Customer quoted/asked: $...\n"
+                                "  2. Company can provide: $... (coverage amount/limit/service fee/deductible as stated in Q&A)\n"
+                                "- Situation: what happened / what customer is claiming (from Situation lines)\n"
+                                "- What’s covered (numeric list, if any)\n"
+                                "- What’s not covered / limitations (numeric list, if any)\n"
+                                "- Why (1–2 short sentences grounded in the Q&A outcomes; no policy speculation)\n"
+                                "- Next steps (specific actions the customer should take)\n"
+                                "\n"
+                                "If outcomes are mixed for the same item, use PARTIAL and clearly break down covered vs not covered.\n"
+                                "Be concise, decisive, and avoid hypothetical/if-then language.\n"
+                                "End with a short overall next step (1–2 bullets) if multiple items exist.\n\n"
                                 "{qa_blob}\n"
                             ),
                         )

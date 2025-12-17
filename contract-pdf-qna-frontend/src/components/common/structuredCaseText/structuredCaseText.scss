@@ -1,0 +1,29 @@
+.structured_case_text {
+  .sct_paragraph {
+    margin: 0 0 10px 0;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    color: #333333;
+    white-space: normal;
+  }
+
+  .sct_bullets {
+    margin: 0 0 12px 0;
+    padding-left: 18px;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    color: #333333;
+
+    li {
+      margin: 6px 0;
+    }
+  }
+
+  .sct_inline_bold {
+    font-weight: 800;
+  }
+}
+
+

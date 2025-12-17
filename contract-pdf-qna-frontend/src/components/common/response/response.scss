@@ -2,10 +2,10 @@
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
-  gap: 16px;
+  gap: 12px;
   width: 100%;
-  margin-bottom: 42px;
-  padding: 14px 0;
+  margin-bottom: 26px;
+  padding: 10px 0;
 
   .response_section {
     display: flex;
@@ -131,9 +131,27 @@
     }
 
     .chunks_list {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-items: start;
+    }
+
+    // Responsive fallbacks (avoid squishing cards on smaller viewports)
+    @media (max-width: 1100px) {
+      .chunks_list {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 860px) {
+      .chunks_list {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 560px) {
+      .chunks_list {
+        grid-template-columns: 1fr;
+      }
     }
 
     .chunk_item {
@@ -141,12 +159,71 @@
       border-radius: 10px;
       background: #fafafa;
       padding: 10px 12px;
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.03);
+      transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+
+      &:hover {
+        background: #ffffff;
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.06);
+        transform: translateY(-1px);
+      }
+
+      // Keep the "expanded details" feel from list view by letting open cards span the full row.
+      &[open] {
+        grid-column: 1 / -1;
+        background: #ffffff;
+      }
 
       .chunk_summary {
         cursor: pointer;
         font-size: 14px;
         font-weight: 600;
         color: #333333;
+        list-style: none;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+
+        &::-webkit-details-marker {
+          display: none;
+        }
+      }
+
+      .chunk_summary_text {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .chunk_close {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 999px;
+        border: 1px solid #e6e6e6;
+        background: #ffffff;
+        color: #6b6b6b;
+        font-size: 18px;
+        line-height: 18px;
+        font-weight: 700;
+        cursor: pointer;
+        flex: 0 0 auto;
+        padding: 0;
+
+        &:hover {
+          background: #f4f6ff;
+          border-color: #dfe6ff;
+          color: #2f3a57;
+        }
+      }
+
+      // Only show the close button when the clause is expanded.
+      &:not([open]) {
+        .chunk_close {
+          display: none;
+        }
       }
 
       .chunk_content {

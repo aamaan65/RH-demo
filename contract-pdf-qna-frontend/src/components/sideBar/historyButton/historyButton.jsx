@@ -96,6 +96,7 @@ const HistoryButton = ({
           type="text"
           autoFocus
           className="input_text"
+          title={conversationName || ""}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               editConversationName(e);
@@ -107,7 +108,9 @@ const HistoryButton = ({
           }}
         />
       ) : (
-        <button className="input_text">{conversationName}</button>
+        <button className="input_text" title={conversationName || ""}>
+          {conversationName}
+        </button>
       )}
       <div className="icons_container">
         {isEditActive ? (
