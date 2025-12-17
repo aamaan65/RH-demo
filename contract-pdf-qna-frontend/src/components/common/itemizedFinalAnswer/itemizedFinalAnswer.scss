@@ -1,0 +1,216 @@
+.itemized_final_answer {
+  &.ifa_outer_card {
+    border: 1px solid #e6e6e6;
+    border-radius: 14px;
+    background: #ffffff;
+    padding: 12px 14px;
+    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.07);
+  }
+
+  .ifa_title {
+    font-size: 14px;
+    font-weight: 800;
+    color: #333333;
+    margin-bottom: 10px;
+  }
+
+  .ifa_overall {
+    margin-bottom: 12px;
+  }
+
+  .ifa_cards {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .ifa_card {
+    border: 1px solid #e6e6e6;
+    border-radius: 14px;
+    background: #ffffff;
+    padding: 12px 14px;
+    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.07);
+  }
+
+  .ifa_item_header {
+    margin-bottom: 8px;
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 0.3px;
+    color: #2f3a57;
+    text-transform: uppercase;
+  }
+
+  .ifa_keyfacts {
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(94, 123, 198, 0.18);
+    background: linear-gradient(180deg, #fbfcff 0%, #ffffff 100%);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    }
+
+  .ifa_keyfacts_row {
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 10px;
+    align-items: start;
+
+    .k {
+      font-size: 12px;
+      font-weight: 900;
+      color: #2f3a57;
+    }
+
+    .v {
+      font-size: 12px;
+      font-weight: 900;
+      color: #111111;
+      line-height: 18px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .item_no {
+      font-size: 12px;
+      font-weight: 800;
+        color: #2f3a57;
+      opacity: 0.85;
+    }
+  }
+
+  .ifa_badge {
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 900;
+    border: 1px solid #e6e6e6;
+    background: #fbfbfb;
+    color: #2f3a57;
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+
+  .ifa_badge_approved {
+    border-color: #bfead6;
+    background: #e9fbf2;
+    color: #0f5f3a;
+  }
+  .ifa_badge_rejected {
+    border-color: #ffd0d0;
+    background: #fff2f2;
+    color: #a11a1a;
+  }
+  .ifa_badge_partial {
+    border-color: #ffe1ad;
+    background: #fff8ea;
+    color: #7a4c00;
+  }
+  .ifa_badge_need_info,
+  .ifa_badge_cannot_determine {
+    border-color: #ededed;
+    background: #f7f7f7;
+    color: #6b6b6b;
+  }
+  .ifa_badge_no_decision {
+    border-color: #e6e6e6;
+    background: #fafafa;
+    color: #888888;
+    font-style: italic;
+  }
+
+  .ifa_amounts_top {
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    border-radius: 12px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.7);
+  }
+
+  .ifa_overall_next {
+    margin-top: 14px;
+    border: 1px solid #e6e6e6;
+    border-radius: 14px;
+    background: #fbfbfb;
+    padding: 12px 14px;
+  }
+
+  .ifa_meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+
+    .row {
+      display: grid;
+      grid-template-columns: 90px 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .k {
+      font-size: 12px;
+      font-weight: 900;
+      color: #2f3a57;
+    }
+    .v {
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 18px;
+      color: #333333;
+      white-space: pre-wrap;
+    }
+  }
+
+  .ifa_split {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+    margin-bottom: 10px;
+
+    @media (min-width: 900px) {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .ifa_split,
+  .ifa_amounts,
+  .ifa_why,
+  .ifa_next {
+    .h {
+      font-size: 12px;
+      font-weight: 900;
+      color: #2f3a57;
+      margin-bottom: 6px;
+    }
+    ul {
+      margin: 0;
+      padding-left: 18px;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 18px;
+      color: #333333;
+    }
+  }
+
+  .ifa_amounts {
+    margin-bottom: 10px;
+    .sub {
+      margin-top: 6px;
+    }
+    .k {
+      font-size: 12px;
+      font-weight: 900;
+      color: #333333;
+      margin-bottom: 4px;
+    }
+  }
+}
+
+

@@ -123,7 +123,7 @@ const ReferredClauses = () => {
       </div>
       <hr className="horizontal-line" />
       <div className="clauses-section">
-        <div className="clauses-title">Referred Clauses</div>
+        <div className="clauses-title">Contract clauses (referred info)</div>
         {lines.map((line, index) =>
           line === "---" ? (
             <hr className="horizontal-line" key={index} />

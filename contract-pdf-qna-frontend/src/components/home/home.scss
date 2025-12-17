@@ -18,6 +18,17 @@
         width: 926px;
         max-width: 926px;
 
+        // Claims landing page: reuse the Search/Infer "prompt" layout for consistency.
+        .calls_prompt_wrapper {
+          margin-top: 48px;
+        }
+
+        // Make the Claims landing cards read like informational cards (not clickable prompts).
+        .calls_landing_card {
+          cursor: default;
+          user-select: none;
+        }
+
         .calls_intro {
           margin-top: 48px;
           display: flex;
@@ -304,6 +315,24 @@
           }
         }
 
+        .conversation_loading {
+          margin-top: 14px;
+          padding: 10px 12px;
+          border: 1px solid #ededed;
+          border-radius: 12px;
+          background: linear-gradient(180deg, #fbfcff 0%, #ffffff 100%);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+
+          .text {
+            font-size: 13px;
+            font-weight: 800;
+            color: #2f3a57;
+          }
+        }
+
         .calls_decision {
           margin-top: 12px;
           margin-bottom: 18px;
@@ -473,9 +502,12 @@
                 font-size: 15px;
                 color: #111111;
                 font-weight: 900;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
+                line-height: 22px;
+                overflow: visible;
+                text-overflow: initial;
+                white-space: normal;
+                word-break: break-word;
+                overflow-wrap: anywhere;
               }
 
               .q_dropdown_icon {

@@ -1,6 +1,7 @@
 import React from "react";
 import responseIcon from "../../../assets/response.svg";
 import responseBlueIcon from "../../../assets/response_blue.svg";
+import { ItemizedFinalAnswer } from "../itemizedFinalAnswer/itemizedFinalAnswer";
 import "./response.scss";
 
 const renderInlineBold = (text) => {
@@ -148,12 +149,16 @@ const Response = ({
           <div
             className="response_text"
           >
-            {renderResponseContent(response)}
+            {variant === "finalAnswer" ? (
+              <ItemizedFinalAnswer text={response} title="" asCard={true} />
+            ) : (
+              renderResponseContent(response)
+            )}
           </div>
 
           {Array.isArray(relevantChunks) && relevantChunks.length > 0 ? (
             <div className="chunks_wrapper">
-              <div className="chunks_title">Data Chunks</div>
+              <div className="chunks_title">Contract clauses (referred info)</div>
               <div className="chunks_list">
                 {relevantChunks.map((chunk, index) => {
                   const score =
@@ -162,6 +167,25 @@ const Response = ({
                     score !== undefined && score !== null
                       ? ` (score: ${score})`
                       : "";
+                  const metadata =
+                    chunk && typeof chunk === "object"
+                      ? chunk.metadata || chunk.meta || undefined
+                      : undefined;
+                  const source =
+                    metadata && typeof metadata === "object"
+                      ? metadata.source || metadata.file || metadata.document || metadata.doc || ""
+                      : "";
+                  const additional =
+                    metadata && typeof metadata === "object"
+                      ? metadata.section ||
+                        metadata.heading ||
+                        metadata.title ||
+                        metadata.page ||
+                        metadata.clause ||
+                        ""
+                      : "";
+                  const refParts = [source, additional].filter(Boolean);
+                  const refSuffix = refParts.length ? ` — ${refParts.join(" · ")}` : "";
                   const content =
                     chunk && typeof chunk === "object"
                       ? chunk.content || JSON.stringify(chunk, null, 2)
@@ -169,7 +193,24 @@ const Response = ({
                   return (
                     <details className="chunk_item" key={index}>
                       <summary className="chunk_summary">
-                        {`Chunk ${index + 1}${titleSuffix}`}
+                        <span className="chunk_summary_text">
+                        {`Clause ${index + 1}${titleSuffix}${refSuffix}`}
+                        </span>
+                        <button
+                          type="button"
+                          className="chunk_close"
+                          aria-label={`Close Clause ${index + 1}`}
+                          title="Close"
+                          onClick={(e) => {
+                            // Don't toggle the <details> via the <summary> click.
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const detailsEl = e.currentTarget?.closest?.("details");
+                            if (detailsEl) detailsEl.open = false;
+                          }}
+                        >
+                          ×
+                        </button>
                       </summary>
                       <pre className="chunk_content">{content}</pre>
                     </details>

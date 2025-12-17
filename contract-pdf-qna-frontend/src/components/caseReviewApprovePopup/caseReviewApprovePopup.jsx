@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from "react";
 import "./caseReviewApprovePopup.scss";
+import { ItemizedDecision } from "../common/itemizedDecision/itemizedDecision";
+import { ItemizedFinalAnswer } from "../common/itemizedFinalAnswer/itemizedFinalAnswer";
 
 const decisionToneClass = (decision) => {
   const raw = String(decision || "");
@@ -104,20 +106,7 @@ const CaseReviewApprovePopup = ({
             <div className="section_title">Decision</div>
             {decision?.decision ? (
               <div className={`decision_box ${decisionToneClass(decision.decision)}`}>
-                <div className="headline">
-                  <span className="label">Decision:</span>{" "}
-                  <span className="value">{decision.decision}</span>
-                </div>
-                {decision.shortAnswer ? (
-                  <div className="short">{decision.shortAnswer}</div>
-                ) : null}
-                {Array.isArray(decision.reasons) && decision.reasons.length > 0 ? (
-                  <ul className="reasons">
-                    {decision.reasons.slice(0, 6).map((r, idx) => (
-                      <li key={idx}>{r}</li>
-                    ))}
-                  </ul>
-                ) : null}
+                <ItemizedDecision decision={decision} />
               </div>
             ) : (
               <div className="empty">No decision available for this case yet.</div>
@@ -132,7 +121,9 @@ const CaseReviewApprovePopup = ({
             {aiFinalDraft ? (
               <div className="ai_draft">
                 <div className="ai_label">AI draft summary</div>
-                <pre className="ai_text">{aiFinalDraft}</pre>
+                <div className="ai_text">
+                  <ItemizedFinalAnswer text={aiFinalDraft} title="" asCard={true} />
+                </div>
               </div>
             ) : null}
             <div className="comments_header">
