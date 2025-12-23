@@ -345,6 +345,8 @@ You are assisting an AHS customer care executive with home insurance related inq
 
 You are given a tool named Knowledge Base, always use this tool to answer the questions. 
 
+You also have access to a tool named User Lookup that can fetch user details from the database based on mobile number. Use this tool when you need to retrieve customer information or user profile data. 
+
 The inquiry asked might be subject to some exclusions and limitations which need to be checked for first before answering the rest of the inquiry. 
 You have to break down these complex inquiries into multiple subqueries and then use the knowledge base tool multiple times to return the overall answer from the subqueries for the customer's inquiry. 
 Make sure to answer to all the subqueries before you return the final answer.
@@ -391,6 +393,36 @@ If the inquiry is unrelated to home repair and service, answer with "I don't hav
 """
 
 
+def fetch_user_by_mobile(mobile_number: str) -> str:
+    """
+    Fetch user details from the database based on mobile number.
+    
+    Args:
+        mobile_number: The mobile number to search for
+        
+    Returns:
+        A string containing user details in JSON format, or an error message
+    """
+    try:
+        # Access the 'ahs' database and 'Users' collection
+        ahs_db = mongo_client["ahs"]
+        users_collection = ahs_db["Users"]
+        
+        # Search for user by mobile number
+        user = users_collection.find_one({"mobile": mobile_number})
+        
+        if user:
+            # Convert ObjectId to string for JSON serialization
+            if "_id" in user:
+                user["_id"] = str(user["_id"])
+            # Return user details as JSON string
+            return json.dumps(user, indent=2, default=str)
+        else:
+            return f"No user found with mobile number: {mobile_number}"
+    except Exception as e:
+        return f"Error fetching user details: {str(e)}"
+
+
 def input_prompt(entered_query, qa, llm):
     # Retriever chain as Tool for agent
     knowledge_base_tool = Tool(
@@ -400,8 +432,19 @@ def input_prompt(entered_query, qa, llm):
             "Useful for answering questions related to insurance coverage of home appliances, home fixtures, their repairs/replacement, service requests, about the renewal, cancellation or refund policies, whether a certain service is covered under the contract, permit limit, code violation limit, modification limit, limitations and exclusions."
         ),
     )
+    
+    # User lookup tool
+    user_lookup_tool = Tool(
+        name="User Lookup",
+        func=fetch_user_by_mobile,
+        description=(
+            "Useful for fetching user details from the database based on mobile number. "
+            "Use this tool when you need to retrieve customer information, user profile, or any user-related data. "
+            "Input should be the mobile number as a string. Returns user details in JSON format if found, or an error message if not found."
+        ),
+    )
 
-    tools = [knowledge_base_tool]
+    tools = [knowledge_base_tool, user_lookup_tool]
 
     current_time = time()
 
