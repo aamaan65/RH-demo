@@ -1,0 +1,35 @@
+services:
+  contract-pdf-qna:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    # Put your secrets/config in `contract-pdf-qna/.env`
+    # This loads ALL variables from that file into the container environment.
+    env_file:
+      - ./.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      # GCP credentials (fixes: "default credentials were not found")
+      # If you mount a different JSON, override these in .env
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-/app/bigquery.json}
+      - GCP_SERVICE_ACCOUNT_PATH=${GCP_SERVICE_ACCOUNT_PATH:-/app/bigquery.json}
+    volumes:
+      # Mount files directory if needed
+      - ./files:/app/files
+      # Ensure the service account JSON is present inside the container at the expected path
+      - ./bigquery.json:/app/bigquery.json:ro
+      # Mount credentials if needed (uncomment and adjust path)
+      # - ./path/to/credentials.json:/app/credentials.json:ro
+    restart: unless-stopped
+    healthcheck:
+      # app.py doesn't define /health; use a lightweight endpoint that exists
+      # /transcripts is protected and returns 401 without auth; treat 200 or 401 as healthy.
+      # NOTE: docker compose interpolates `$VAR` in YAML; use `$$` to pass a literal `$` into the container shell.
+      test: ["CMD-SHELL", "code=$$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8001/transcripts); echo $$code | grep -Eq '^(200|401)$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
