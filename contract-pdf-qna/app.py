@@ -1,8 +1,13 @@
 # Set the OpenAI API Keys, embedding model,
+
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import asyncio
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, make_response, Response, stream_with_context
+from flask_socketio import SocketIO
 from pymongo import MongoClient, ReturnDocument
 from datetime import datetime
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -93,6 +98,12 @@ memory1 = InMemoryChatMessageHistory()
 handler = CallbackHandler()
 load_dotenv()
 app = Flask(__name__)
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='eventlet',
+)
 
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE")
 JWKS_URL = os.getenv("JWKS_URL")
@@ -405,7 +416,7 @@ def fetch_user_by_mobile(mobile_number: str) -> str:
     """
     try:
         # Access the 'ahs' database and 'Users' collection
-        ahs_db = mongo_client["ahs"]
+        ahs_db = mongo_client["AHS"]
         users_collection = ahs_db["Users"]
         
         # Search for user by mobile number
@@ -4970,5 +4981,37 @@ def process_transcript():
         }), 500
 
 
+@app.route("/transcript-event", methods=["POST"])
+def transcript_event():
+    # simple shared-secret auth
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {os.getenv('FLASK_AUTH_TOKEN')}":
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json()
+    if not data:
+        return {"error": "invalid payload"}, 400
+    
+    session_id = data.get("sessionId")
+    if not session_id:
+        return {"error": "sessionId is required"}, 400
+
+    # broadcast to UI via websocket
+    # 🔥 LOG TRANSCRIPT EVENT
+    print("🔴 TRANSCRIPT RECEIVED:", json.dumps(data, indent=2))
+    socketio.emit(
+        "transcript_update",
+        data,
+        room=data["sessionId"]  # important
+    )
+
+    return {"ok": True}
+
+@socketio.on("join_session")
+def on_join_session(data):
+    session_id = data.get("sessionId")
+    if session_id:
+        join_room(session_id)
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8001, debug=True)
+    socketio.run(app, host="0.0.0.0", port=8001, debug=True)
